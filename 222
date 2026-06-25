@@ -1,0 +1,1021 @@
+# """
+# Improved DMRL: Counterfactual Sparse Polar Evidence Transport
+# for multimodal sentiment analysis.
+#
+# Compared with the previous version, this implementation makes the model
+# more compact and internally consistent for paper submission:
+# 1. Modality-specific stems + shared Transformer encoder with lightweight adapters
+# 2. Hybrid static + input-adaptive sparse evidence slots
+# 3. Strength/uncertainty-aware evidence pooling
+# 4. Sinkhorn-style uncertainty-aware evidence transport
+# 5. Soft consensus/conflict/residual role decomposition
+# 6. Counterfactual router using the same main prediction head for factual and CF predictions
+# 7. Ordinal distribution head with predictive variance instead of an extra interval head
+# """
+#
+# import os
+# os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+#
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# from transformers import BertModel, BertTokenizer, RobertaModel, RobertaTokenizer
+#
+#
+# TRANSFORMERS_MAP = {
+#     "bert": (BertTokenizer, BertModel),
+#     "roberta": (RobertaTokenizer, RobertaModel),
+# }
+#
+# ORDINAL_ANCHORS = (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0)
+#
+#
+# def build_sequence_mask(x, mask=None):
+#     """Build boolean mask [B, T], True means valid."""
+#     if mask is not None:
+#         seq_mask = mask.bool()
+#     elif x.dim() == 3:
+#         seq_mask = (x.abs().sum(dim=-1) > 0).bool()
+#     else:
+#         seq_mask = (x > 0).bool()
+#
+#     if seq_mask.dim() == 2:
+#         empty_rows = ~seq_mask.any(dim=1)
+#         if empty_rows.any():
+#             seq_mask = seq_mask.clone()
+#             seq_mask[empty_rows, 0] = True
+#     return seq_mask
+#
+#
+# def masked_mean(x, mask):
+#     """Masked mean pooling for [B, T, D]."""
+#     w = mask.unsqueeze(-1).to(x.dtype)
+#     return (x * w).sum(dim=1) / w.sum(dim=1).clamp_min(1e-6)
+#
+#
+# def evidence_weighted_pool(ev):
+#     """Pool evidence slots by reliability = strength - uncertainty."""
+#     weights = ev["slot_weight"].unsqueeze(-1)
+#     return (weights * ev["evidence"]).sum(dim=1)
+#
+#
+# def offdiag_mean_square(sim):
+#     """Mean squared off-diagonal similarity for slot diversity."""
+#     k = sim.size(-1)
+#     eye = torch.eye(k, device=sim.device, dtype=sim.dtype).unsqueeze(0)
+#     off = (1.0 - eye)
+#     return ((sim * off) ** 2).sum() / off.sum().clamp_min(1.0) / sim.size(0)
+#
+#
+# class BertTextEncoder(nn.Module):
+#     """BERT/RoBERTa text encoder returning token-level features [B, Lt, H]."""
+#
+#     def __init__(self, use_finetune=False, transformers="bert", pretrained="bert-base-uncased"):
+#         super().__init__()
+#         tokenizer_class, model_class = TRANSFORMERS_MAP[transformers]
+#         self.tokenizer = tokenizer_class.from_pretrained(pretrained)
+#         self.model = model_class.from_pretrained(pretrained)
+#         self.use_finetune = use_finetune
+#         self.transformers = transformers
+#         self.hidden_size = self.model.config.hidden_size
+#
+#     def forward(self, text):
+#         input_ids = text[:, 0, :].long()
+#         input_mask = text[:, 1, :].long()
+#         segment_ids = text[:, 2, :].long()
+#
+#         kwargs = {
+#             "input_ids": input_ids,
+#             "attention_mask": input_mask,
+#         }
+#         if self.transformers == "bert":
+#             kwargs["token_type_ids"] = segment_ids
+#
+#         if self.use_finetune:
+#             return self.model(**kwargs)[0]
+#
+#         with torch.no_grad():
+#             return self.model(**kwargs)[0]
+#
+#
+# class MultiScaleTemporalStem(nn.Module):
+#     """Parallel multi-scale Conv1d stem with residual projection."""
+#
+#     def __init__(self, d_in, d_model, kernels=(1, 3, 5), dropout=0.1):
+#         super().__init__()
+#         branch_dim = d_model
+#         self.branches = nn.ModuleList([
+#             nn.Sequential(
+#                 nn.Conv1d(d_in, branch_dim, kernel_size=k, padding=k // 2, bias=False),
+#                 nn.GELU(),
+#                 nn.Dropout(dropout),
+#             )
+#             for k in kernels
+#         ])
+#         self.out_proj = nn.Linear(branch_dim * len(kernels), d_model)
+#         self.res_proj = nn.Linear(d_in, d_model) if d_in != d_model else nn.Identity()
+#         self.norm = nn.LayerNorm(d_model)
+#         self.drop = nn.Dropout(dropout)
+#
+#     def forward(self, x):
+#         residual = self.res_proj(x)
+#         x_t = x.transpose(1, 2)
+#         feats = [branch(x_t).transpose(1, 2) for branch in self.branches]
+#         h = self.out_proj(torch.cat(feats, dim=-1))
+#         return self.norm(self.drop(h) + residual)
+#
+#
+# class ModalityAdapter(nn.Module):
+#     """Small modality-specific residual adapter after the shared encoder."""
+#
+#     def __init__(self, d_model, bottleneck=None, dropout=0.1):
+#         super().__init__()
+#         bottleneck = bottleneck or max(d_model // 4, 16)
+#         self.net = nn.Sequential(
+#             nn.LayerNorm(d_model),
+#             nn.Linear(d_model, bottleneck),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(bottleneck, d_model),
+#         )
+#         self.scale = nn.Parameter(torch.ones(1) * 0.5)
+#
+#     def forward(self, x):
+#         return x + self.scale * self.net(x)
+#
+#
+# class MaskedTransformerBlock(nn.Module):
+#     """Pre-norm Transformer encoder block with mask support."""
+#
+#     def __init__(self, d_model, n_heads=4, ff_mult=4, dropout=0.1):
+#         super().__init__()
+#         self.block = nn.TransformerEncoderLayer(
+#             d_model=d_model,
+#             nhead=n_heads,
+#             dim_feedforward=d_model * ff_mult,
+#             dropout=dropout,
+#             activation="gelu",
+#             batch_first=True,
+#             norm_first=True,
+#         )
+#
+#     def forward(self, x, mask=None):
+#         key_padding_mask = ~mask if mask is not None else None
+#         x = self.block(x, src_key_padding_mask=key_padding_mask)
+#         if mask is not None:
+#             x = x * mask.unsqueeze(-1).to(x.dtype)
+#         return x
+#
+#
+# class MaskedTransformerEncoder(nn.Module):
+#     """Stacked mask-aware Transformer encoder."""
+#
+#     def __init__(self, d_model, n_layers=3, dropout=0.1, n_heads=4, ff_mult=4):
+#         super().__init__()
+#         self.blocks = nn.ModuleList([
+#             MaskedTransformerBlock(d_model, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout)
+#             for _ in range(n_layers)
+#         ])
+#         self.norm = nn.LayerNorm(d_model)
+#
+#     def forward(self, x, mask=None):
+#         if mask is not None:
+#             x = x * mask.unsqueeze(-1).to(x.dtype)
+#         for blk in self.blocks:
+#             x = blk(x, mask=mask)
+#         x = self.norm(x)
+#         if mask is not None:
+#             x = x * mask.unsqueeze(-1).to(x.dtype)
+#         return x
+#
+#
+# class SparsePolarEvidenceExtractor(nn.Module):
+#     """Sparse slot attention extractor with hybrid static-adaptive queries.
+#
+#     Each slot produces:
+#     - evidence vector z
+#     - polarity p in [-1, 1]
+#     - strength s >= 0
+#     - uncertainty u >= 0
+#     - temporal position tau in [0, 1]
+#
+#     The slot reliability used downstream is s - u.
+#     """
+#
+#     def __init__(self, d_model, k_slots=4, dropout=0.1, topk_attn=0):
+#         super().__init__()
+#         self.k_slots = k_slots
+#         self.topk_attn = topk_attn
+#
+#         self.slot_queries = nn.Parameter(torch.randn(1, k_slots, d_model) * 0.02)
+#         self.query_ctx_proj = nn.Sequential(
+#             nn.Linear(d_model, d_model),
+#             nn.GELU(),
+#             nn.Linear(d_model, d_model),
+#         )
+#         self.query_gate = nn.Sequential(
+#             nn.Linear(d_model * 2, d_model),
+#             nn.GELU(),
+#             nn.Linear(d_model, d_model),
+#             nn.Sigmoid(),
+#         )
+#
+#         self.query_norm = nn.LayerNorm(d_model)
+#         self.key_norm = nn.LayerNorm(d_model)
+#         self.value_proj = nn.Linear(d_model, d_model)
+#
+#         self.polarity_head = nn.Sequential(
+#             nn.Linear(d_model, d_model),
+#             nn.GELU(),
+#             nn.Linear(d_model, 1),
+#             nn.Tanh(),
+#         )
+#         self.strength_head = nn.Sequential(
+#             nn.Linear(d_model, d_model),
+#             nn.GELU(),
+#             nn.Linear(d_model, 1),
+#             nn.Softplus(),
+#         )
+#         self.uncertainty_head = nn.Sequential(
+#             nn.Linear(d_model, d_model),
+#             nn.GELU(),
+#             nn.Linear(d_model, 1),
+#             nn.Softplus(),
+#         )
+#         self.position_head = nn.Sequential(
+#             nn.Linear(d_model, d_model),
+#             nn.GELU(),
+#             nn.Linear(d_model, 1),
+#             nn.Sigmoid(),
+#         )
+#         self.drop = nn.Dropout(dropout)
+#
+#     def _sparse_softmax(self, scores, mask):
+#         scores = scores.masked_fill(~mask.unsqueeze(1), -1e4)
+#
+#         if self.topk_attn is not None and self.topk_attn > 0 and self.topk_attn < scores.size(-1):
+#             vals, idx = scores.topk(self.topk_attn, dim=-1)
+#             sparse_scores = torch.full_like(scores, -1e4)
+#             sparse_scores.scatter_(-1, idx, vals)
+#             scores = sparse_scores
+#
+#         attn = F.softmax(scores, dim=-1)
+#         attn = attn * mask.unsqueeze(1).to(attn.dtype)
+#         attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+#         return attn
+#
+#     def forward(self, x, mask=None):
+#         B, T, D = x.shape
+#         if mask is None:
+#             mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+#
+#         global_ctx = masked_mean(x, mask)
+#         base_q = self.slot_queries.expand(B, -1, -1)
+#         ctx_q = self.query_ctx_proj(global_ctx).unsqueeze(1).expand(-1, self.k_slots, -1)
+#         gate = self.query_gate(torch.cat([base_q, ctx_q], dim=-1))
+#         q = self.query_norm(base_q + gate * ctx_q)
+#
+#         k = self.key_norm(x)
+#         scores = torch.matmul(q, k.transpose(1, 2)) / (D ** 0.5)
+#         attn = self._sparse_softmax(scores, mask)
+#
+#         evidence = self.drop(torch.matmul(attn, self.value_proj(x)))
+#         polarity = self.polarity_head(evidence).squeeze(-1)
+#         strength = self.strength_head(evidence).squeeze(-1)
+#         uncertainty = self.uncertainty_head(evidence).squeeze(-1)
+#
+#         pos_grid = torch.linspace(0.0, 1.0, T, device=x.device, dtype=x.dtype).view(1, 1, T)
+#         attn_position = (attn * pos_grid).sum(dim=-1)
+#         learned_position = self.position_head(evidence).squeeze(-1)
+#         tau = 0.5 * attn_position + 0.5 * learned_position
+#
+#         reliability = strength - uncertainty
+#         slot_weight = F.softmax(reliability, dim=-1)
+#
+#         evidence_norm = F.normalize(evidence, dim=-1, eps=1e-6)
+#         slot_sim = torch.matmul(evidence_norm, evidence_norm.transpose(1, 2))
+#
+#         return {
+#             "evidence": evidence,
+#             "polarity": polarity,
+#             "strength": strength,
+#             "uncertainty": uncertainty,
+#             "reliability": reliability,
+#             "slot_weight": slot_weight,
+#             "tau": tau,
+#             "attn": attn,
+#             "slot_sim": slot_sim,
+#         }
+#
+#
+# class SinkhornEvidenceTransport(nn.Module):
+#     """Uncertainty-aware Sinkhorn-style evidence transport.
+#
+#     Cost = feature distance + temporal distance + polarity distance + uncertainty penalty.
+#     """
+#
+#     def __init__(
+#         self,
+#         lambda_f=1.0,
+#         lambda_t=0.5,
+#         lambda_p=0.5,
+#         lambda_u=0.25,
+#         temperature=0.2,
+#         sinkhorn_iters=5,
+#     ):
+#         super().__init__()
+#         self.lambda_f = lambda_f
+#         self.lambda_t = lambda_t
+#         self.lambda_p = lambda_p
+#         self.lambda_u = lambda_u
+#         self.temperature = temperature
+#         self.sinkhorn_iters = sinkhorn_iters
+#
+#     def sinkhorn(self, log_alpha):
+#         for _ in range(self.sinkhorn_iters):
+#             log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)
+#             log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)
+#         transport = log_alpha.exp()
+#         transport = transport / transport.sum(dim=(-1, -2), keepdim=True).clamp_min(1e-6)
+#         return transport
+#
+#     def forward(self, evidence_a, evidence_b):
+#         ea = F.normalize(evidence_a["evidence"], dim=-1, eps=1e-6)
+#         eb = F.normalize(evidence_b["evidence"], dim=-1, eps=1e-6)
+#         sim = torch.matmul(ea, eb.transpose(1, 2))
+#
+#         cost_feat = 1.0 - sim
+#         cost_time = (evidence_a["tau"].unsqueeze(-1) - evidence_b["tau"].unsqueeze(-2)).abs()
+#         cost_polar = (evidence_a["polarity"].unsqueeze(-1) - evidence_b["polarity"].unsqueeze(-2)).abs()
+#         cost_unc = 0.5 * (
+#             evidence_a["uncertainty"].unsqueeze(-1) + evidence_b["uncertainty"].unsqueeze(-2)
+#         )
+#
+#         cost = (
+#             self.lambda_f * cost_feat
+#             + self.lambda_t * cost_time
+#             + self.lambda_p * cost_polar
+#             + self.lambda_u * cost_unc
+#         )
+#
+#         log_alpha = -cost / max(self.temperature, 1e-6)
+#         transport = self.sinkhorn(log_alpha)
+#         return transport, cost, sim
+#
+#
+# class SoftRoleEvidenceTransport(nn.Module):
+#     """Polarity-aware soft role decomposition.
+#
+#     For each evidence pair, softly assigns evidence into:
+#     - consensus: aligned semantics and similar polarity
+#     - conflict: aligned semantics but different polarity
+#     - residual: weakly aligned or uncertain evidence
+#     """
+#
+#     def __init__(
+#         self,
+#         d_model,
+#         lambda_role_p=1.0,
+#         lambda_role_u=0.5,
+#         role_temperature=0.5,
+#         use_av_pair=False,
+#         transport_temperature=0.2,
+#         sinkhorn_iters=5,
+#     ):
+#         super().__init__()
+#         self.use_av_pair = use_av_pair
+#         self.lambda_role_p = lambda_role_p
+#         self.lambda_role_u = lambda_role_u
+#         self.role_temperature = role_temperature
+#
+#         self.match = SinkhornEvidenceTransport(
+#             temperature=transport_temperature,
+#             sinkhorn_iters=sinkhorn_iters,
+#         )
+#
+#         self.role_proj_cons = nn.Linear(d_model, d_model)
+#         self.role_proj_conf = nn.Linear(d_model, d_model)
+#         self.role_proj_res = nn.Linear(d_model, d_model)
+#
+#     def _pair_roles(self, ea, eb, transport, sim):
+#         feat_a = ea["evidence"]
+#         feat_b = eb["evidence"]
+#
+#         # Row-normalized transport is used for constructing paired evidence.
+#         row_t = transport / transport.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+#         paired_b = torch.matmul(row_t, feat_b)
+#         paired_pol_b = torch.matmul(row_t, eb["polarity"].unsqueeze(-1)).squeeze(-1)
+#         paired_unc_b = torch.matmul(row_t, eb["uncertainty"].unsqueeze(-1)).squeeze(-1)
+#
+#         avg_sim = (row_t * sim).sum(dim=-1)
+#         polarity_gap = (ea["polarity"] - paired_pol_b).abs()
+#         pair_unc = 0.5 * (ea["uncertainty"] + paired_unc_b)
+#
+#         cons_score = avg_sim - self.lambda_role_p * polarity_gap - self.lambda_role_u * pair_unc
+#         conf_score = avg_sim + self.lambda_role_p * polarity_gap - self.lambda_role_u * pair_unc
+#         res_score = -avg_sim + self.lambda_role_u * pair_unc
+#
+#         role_logits = torch.stack([cons_score, conf_score, res_score], dim=-1)
+#         role_prob = F.softmax(role_logits / max(self.role_temperature, 1e-6), dim=-1)
+#
+#         consensus = role_prob[..., 0:1] * 0.5 * (feat_a + paired_b)
+#         conflict = role_prob[..., 1:2] * (feat_a - paired_b)
+#         residual = role_prob[..., 2:3] * feat_a
+#
+#         return consensus, conflict, residual, role_prob
+#
+#     def _bidirectional_roles(self, ea, eb, transport, sim):
+#         cons_ab, conf_ab, res_ab, prob_ab = self._pair_roles(ea, eb, transport, sim)
+#         cons_ba, conf_ba, res_ba, prob_ba = self._pair_roles(
+#             eb, ea, transport.transpose(1, 2), sim.transpose(1, 2)
+#         )
+#         return (
+#             torch.cat([cons_ab, cons_ba], dim=1),
+#             torch.cat([conf_ab, conf_ba], dim=1),
+#             torch.cat([res_ab, res_ba], dim=1),
+#             torch.cat([prob_ab, prob_ba], dim=1),
+#         )
+#
+#     def forward(self, text_ev, audio_ev, video_ev):
+#         ta, cost_ta, sim_ta = self.match(text_ev, audio_ev)
+#         tv, cost_tv, sim_tv = self.match(text_ev, video_ev)
+#
+#         cons_ta, conf_ta, res_ta, role_prob_ta = self._bidirectional_roles(text_ev, audio_ev, ta, sim_ta)
+#         cons_tv, conf_tv, res_tv, role_prob_tv = self._bidirectional_roles(text_ev, video_ev, tv, sim_tv)
+#
+#         consensus_banks = [cons_ta, cons_tv]
+#         conflict_banks = [conf_ta, conf_tv]
+#         residual_banks = [res_ta, res_tv]
+#         role_probs = [role_prob_ta, role_prob_tv]
+#
+#         out = {
+#             "transport_ta": ta,
+#             "transport_tv": tv,
+#             "cost_ta": cost_ta,
+#             "cost_tv": cost_tv,
+#             "sim_ta": sim_ta,
+#             "sim_tv": sim_tv,
+#         }
+#
+#         if self.use_av_pair:
+#             av, cost_av, sim_av = self.match(audio_ev, video_ev)
+#             cons_av, conf_av, res_av, role_prob_av = self._bidirectional_roles(audio_ev, video_ev, av, sim_av)
+#             consensus_banks.append(cons_av)
+#             conflict_banks.append(conf_av)
+#             residual_banks.append(res_av)
+#             role_probs.append(role_prob_av)
+#             out.update({
+#                 "transport_av": av,
+#                 "cost_av": cost_av,
+#                 "sim_av": sim_av,
+#             })
+#
+#         consensus_bank = torch.cat(consensus_banks, dim=1)
+#         conflict_bank = torch.cat(conflict_banks, dim=1)
+#         residual_bank = torch.cat(residual_banks, dim=1)
+#         soft_role_prob = torch.cat(role_probs, dim=1)
+#
+#         out.update({
+#             "consensus_bank": self.role_proj_cons(consensus_bank),
+#             "conflict_bank": self.role_proj_conf(conflict_bank),
+#             "residual_bank": self.role_proj_res(residual_bank),
+#             "soft_role_prob": soft_role_prob,
+#         })
+#         return out
+#
+#
+# class RoleExpert(nn.Module):
+#     def __init__(self, d_model, dropout=0.1):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(d_model, d_model),
+#             nn.LayerNorm(d_model),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(d_model, d_model),
+#             nn.LayerNorm(d_model),
+#             nn.GELU(),
+#         )
+#
+#     def forward(self, x):
+#         return self.net(x)
+#
+#
+# class ConsensusConflictResidualExperts(nn.Module):
+#     def __init__(self, d_model, dropout=0.1):
+#         super().__init__()
+#         self.expert_consensus = RoleExpert(d_model, dropout=dropout)
+#         self.expert_conflict = RoleExpert(d_model, dropout=dropout)
+#         self.expert_residual = RoleExpert(d_model, dropout=dropout)
+#
+#     def _pool_bank(self, bank):
+#         energy = bank.abs().sum(dim=-1, keepdim=True)
+#         weights = energy / energy.sum(dim=1, keepdim=True).clamp_min(1e-6)
+#         return (bank * weights).sum(dim=1)
+#
+#     def forward(self, consensus_bank, conflict_bank, residual_bank):
+#         cons = self.expert_consensus(self._pool_bank(consensus_bank))
+#         conf = self.expert_conflict(self._pool_bank(conflict_bank))
+#         res = self.expert_residual(self._pool_bank(residual_bank))
+#         return cons, conf, res
+#
+#
+# class CounterfactualReliabilityRouter(nn.Module):
+#     """Router supervised by counterfactual prediction changes.
+#
+#     The router uses representation and uncertainty signals. Larger uncertainty
+#     directly decreases the corresponding logit before softmax.
+#     """
+#
+#     def __init__(self, d_model, dropout=0.1, tau=0.5):
+#         super().__init__()
+#         self.tau = tau
+#         self.mod_unc_scale = nn.Parameter(torch.ones(1))
+#         self.role_unc_scale = nn.Parameter(torch.ones(1))
+#
+#         self.mod_router = nn.Sequential(
+#             nn.Linear(d_model * 3 + 3, d_model),
+#             nn.LayerNorm(d_model),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(d_model, 3),
+#         )
+#         self.role_router = nn.Sequential(
+#             nn.Linear(d_model * 3 + 3, d_model),
+#             nn.LayerNorm(d_model),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(d_model, 3),
+#         )
+#
+#     def forward(self, pooled_t, pooled_a, pooled_v, mod_unc, cons, conf, res, role_unc):
+#         mod_input = torch.cat([pooled_t, pooled_a, pooled_v, mod_unc], dim=-1)
+#         role_input = torch.cat([cons, conf, res, role_unc], dim=-1)
+#
+#         mod_logits = self.mod_router(mod_input) - F.softplus(self.mod_unc_scale) * mod_unc
+#         role_logits = self.role_router(role_input) - F.softplus(self.role_unc_scale) * role_unc
+#
+#         mod_weights = F.softmax(mod_logits, dim=-1)
+#         role_weights = F.softmax(role_logits, dim=-1)
+#         return mod_weights, role_weights, mod_logits, role_logits
+#
+#     def counterfactual_targets(self, factual_pred, cf_preds):
+#         deltas = torch.cat([(factual_pred - p).abs() for p in cf_preds], dim=-1)
+#         return F.softmax(deltas / max(self.tau, 1e-6), dim=-1), deltas
+#
+#
+# class OrdinalDistributionHead(nn.Module):
+#     """Ordinal distribution head over sentiment anchors.
+#
+#     The final sentiment is the expectation over anchors. Predictive uncertainty
+#     is the variance of the ordinal distribution.
+#     """
+#
+#     def __init__(self, d_model, anchors=ORDINAL_ANCHORS, dropout=0.1):
+#         super().__init__()
+#         self.register_buffer("anchors", torch.tensor(anchors).float())
+#         self.ordinal_head = nn.Sequential(
+#             nn.Linear(d_model, d_model),
+#             nn.LayerNorm(d_model),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(d_model, len(anchors)),
+#         )
+#
+#     def forward(self, x):
+#         logits = self.ordinal_head(x)
+#         probs = F.softmax(logits, dim=-1)
+#         anchors = self.anchors.unsqueeze(0)
+#         sentiment = (probs * anchors).sum(dim=-1, keepdim=True)
+#         variance = (probs * (anchors - sentiment) ** 2).sum(dim=-1, keepdim=True)
+#         return {
+#             "ordinal_logits": logits,
+#             "ordinal_probs": probs,
+#             "output_logit": sentiment,
+#             "predictive_variance": variance,
+#         }
+#
+#
+# class EvidencePredictionHead(nn.Module):
+#     def __init__(self, d_model, dropout=0.1):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(d_model, d_model // 2),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(d_model // 2, 1),
+#         )
+#
+#     def forward(self, x):
+#         return self.net(x)
+#
+#
+# class DMRLLoss(nn.Module):
+#     def __init__(
+#         self,
+#         anchors=ORDINAL_ANCHORS,
+#         w_main=1.0,
+#         w_uni=0.2,
+#         w_role=0.1,
+#         w_ord=0.2,
+#         w_sparse=0.01,
+#         w_transport=0.02,
+#         w_cf=0.05,
+#         w_var=0.005,
+#     ):
+#         super().__init__()
+#         self.register_buffer("anchors", torch.tensor(anchors).float())
+#         self.l1 = nn.L1Loss()
+#         self.w_main = w_main
+#         self.w_uni = w_uni
+#         self.w_role = w_role
+#         self.w_ord = w_ord
+#         self.w_sparse = w_sparse
+#         self.w_transport = w_transport
+#         self.w_cf = w_cf
+#         self.w_var = w_var
+#
+#     def _labels(self, labels):
+#         return labels.view(-1, 1).float()
+#
+#     def soft_ordinal_target(self, labels):
+#         labels = self._labels(labels)
+#         anchors = self.anchors.view(1, -1).to(labels.device)
+#         dist = torch.exp(-((labels - anchors) ** 2) / 2.0)
+#         return dist / dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+#
+#     def ordinal_loss(self, logits, labels):
+#         target = self.soft_ordinal_target(labels)
+#         return -(target * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+#
+#     def sparse_regularization(self, out):
+#         regs = []
+#         for key in ("text", "audio", "video"):
+#             attn = out[f"{key}_attn"]
+#             slot_sim = out[f"{key}_slot_sim"]
+#             slot_weight = out[f"{key}_slot_weight"]
+#
+#             # Low attention entropy encourages sparse temporal evidence.
+#             attn_entropy = -(attn.clamp_min(1e-8) * attn.clamp_min(1e-8).log()).sum(dim=-1).mean()
+#
+#             # Low slot-weight entropy encourages a few decisive evidence slots.
+#             slot_entropy = -(slot_weight.clamp_min(1e-8) * slot_weight.clamp_min(1e-8).log()).sum(dim=-1).mean()
+#
+#             # Low off-diagonal similarity encourages slot diversity.
+#             diversity = offdiag_mean_square(slot_sim)
+#
+#             regs.extend([attn_entropy, 0.5 * slot_entropy, 0.5 * diversity])
+#
+#         return sum(regs) / len(regs)
+#
+#     def transport_loss(self, out):
+#         terms = []
+#         for pair in ("ta", "tv", "av"):
+#             t_key = f"transport_{pair}"
+#             c_key = f"cost_{pair}"
+#             if t_key in out and c_key in out:
+#                 terms.append((out[t_key] * out[c_key]).sum(dim=(-1, -2)).mean())
+#         if not terms:
+#             return out["output_logit"].new_tensor(0.0)
+#         return sum(terms) / len(terms)
+#
+#     def counterfactual_router_loss(self, out):
+#         mod_kl = F.kl_div(
+#             (out["modality_weights"] + 1e-8).log(),
+#             out["modality_cf_target"],
+#             reduction="batchmean",
+#         )
+#         role_kl = F.kl_div(
+#             (out["role_weights"] + 1e-8).log(),
+#             out["role_cf_target"],
+#             reduction="batchmean",
+#         )
+#         return 0.5 * (mod_kl + role_kl)
+#
+#     def variance_calibration_loss(self, out, labels):
+#         labels = self._labels(labels).to(out["output_logit"].device)
+#         err2 = (out["output_logit"] - labels).pow(2).detach()
+#         return self.l1(out["predictive_variance"], err2)
+#
+#     def forward(self, out, labels):
+#         labels = self._labels(labels).to(out["output_logit"].device)
+#         losses = {}
+#         losses["main_loss"] = self.l1(out["output_logit"], labels)
+#         losses["uni_loss"] = (
+#             self.l1(out["logit_t"], labels)
+#             + self.l1(out["logit_a"], labels)
+#             + self.l1(out["logit_v"], labels)
+#         ) / 3.0
+#         losses["role_loss"] = (
+#             self.l1(out["logit_consensus"], labels)
+#             + self.l1(out["logit_conflict"], labels)
+#             + self.l1(out["logit_residual"], labels)
+#         ) / 3.0
+#         losses["ordinal_loss"] = self.ordinal_loss(out["ordinal_logits"], labels)
+#         losses["sparse_loss"] = self.sparse_regularization(out)
+#         losses["transport_loss"] = self.transport_loss(out)
+#         losses["counterfactual_loss"] = self.counterfactual_router_loss(out)
+#         losses["uncertainty_loss"] = self.variance_calibration_loss(out, labels)
+#         # Backward-compatible alias: previous training scripts may read variance_loss.
+#         losses["variance_loss"] = losses["uncertainty_loss"]
+#
+#         losses["total_loss"] = (
+#             self.w_main * losses["main_loss"]
+#             + self.w_uni * losses["uni_loss"]
+#             + self.w_role * losses["role_loss"]
+#             + self.w_ord * losses["ordinal_loss"]
+#             + self.w_sparse * losses["sparse_loss"]
+#             + self.w_transport * losses["transport_loss"]
+#             + self.w_cf * losses["counterfactual_loss"]
+#             + self.w_var * losses["uncertainty_loss"]
+#         )
+#         return losses
+#
+#
+# class DMRL(nn.Module):
+#     """Improved DMRL with sparse polar evidence transport and counterfactual routing."""
+#
+#     def __init__(self, args):
+#         super().__init__()
+#         d_t, d_a, d_v = args.feature_dims
+#         d_model = args.d_model
+#         n_layers = args.n_layers
+#         dropout = args.dropout
+#         k_slots = getattr(args, "k_slots", 4)
+#         n_heads = getattr(args, "n_heads", 4)
+#         ff_mult = getattr(args, "ff_mult", 4)
+#         topk_attn = getattr(args, "topk_attn", 0)
+#         use_av_pair = getattr(args, "use_av_pair", False)
+#
+#         self.use_bert = getattr(args, "use_bert", True)
+#         if self.use_bert:
+#             self.bert = BertTextEncoder(
+#                 use_finetune=getattr(args, "use_finetune", True),
+#                 transformers=getattr(args, "transformers", "bert"),
+#                 pretrained=getattr(args, "pretrained", "bert-base-uncased"),
+#             )
+#             d_t = self.bert.hidden_size
+#
+#         # Modality-specific stems map all modalities into the same d_model space.
+#         self.stem_t = MultiScaleTemporalStem(d_t, d_model, dropout=dropout)
+#         self.stem_a = MultiScaleTemporalStem(d_a, d_model, dropout=dropout)
+#         self.stem_v = MultiScaleTemporalStem(d_v, d_model, dropout=dropout)
+#
+#         # Shared encoder reduces parameters and encourages a common evidence space.
+#         self.mod_embed = nn.Parameter(torch.randn(3, 1, d_model) * 0.02)
+#         self.shared_encoder = MaskedTransformerEncoder(
+#             d_model,
+#             n_layers=n_layers,
+#             dropout=dropout,
+#             n_heads=n_heads,
+#             ff_mult=ff_mult,
+#         )
+#         self.adapter_t = ModalityAdapter(d_model, dropout=dropout)
+#         self.adapter_a = ModalityAdapter(d_model, dropout=dropout)
+#         self.adapter_v = ModalityAdapter(d_model, dropout=dropout)
+#
+#         self.evidence_t = SparsePolarEvidenceExtractor(d_model, k_slots=k_slots, dropout=dropout, topk_attn=topk_attn)
+#         self.evidence_a = SparsePolarEvidenceExtractor(d_model, k_slots=k_slots, dropout=dropout, topk_attn=topk_attn)
+#         self.evidence_v = SparsePolarEvidenceExtractor(d_model, k_slots=k_slots, dropout=dropout, topk_attn=topk_attn)
+#
+#         self.transport = SoftRoleEvidenceTransport(
+#             d_model,
+#             use_av_pair=use_av_pair,
+#             transport_temperature=getattr(args, "transport_temperature", 0.2),
+#             sinkhorn_iters=getattr(args, "sinkhorn_iters", 5),
+#             role_temperature=getattr(args, "role_temperature", 0.5),
+#         )
+#         self.role_experts = ConsensusConflictResidualExperts(d_model, dropout=dropout)
+#         self.router = CounterfactualReliabilityRouter(
+#             d_model,
+#             dropout=dropout,
+#             tau=getattr(args, "cf_tau", 0.5),
+#         )
+#
+#         self.mod_proj_t = nn.Linear(d_model, d_model)
+#         self.mod_proj_a = nn.Linear(d_model, d_model)
+#         self.mod_proj_v = nn.Linear(d_model, d_model)
+#         self.mod_fuse = nn.Linear(d_model * 3, d_model)
+#         self.final_norm = nn.LayerNorm(d_model)
+#
+#         self.unimodal_t = EvidencePredictionHead(d_model, dropout=dropout)
+#         self.unimodal_a = EvidencePredictionHead(d_model, dropout=dropout)
+#         self.unimodal_v = EvidencePredictionHead(d_model, dropout=dropout)
+#         self.role_head_cons = EvidencePredictionHead(d_model, dropout=dropout)
+#         self.role_head_conf = EvidencePredictionHead(d_model, dropout=dropout)
+#         self.role_head_res = EvidencePredictionHead(d_model, dropout=dropout)
+#         self.ordinal_head = OrdinalDistributionHead(d_model, dropout=dropout)
+#
+#         self.loss_module = DMRLLoss(
+#             w_main=getattr(args, "w_main", 1.0),
+#             w_uni=getattr(args, "w_uni", 0.2),
+#             w_role=getattr(args, "w_role", 0.1),
+#             w_ord=getattr(args, "w_ord", 0.2),
+#             w_sparse=getattr(args, "w_sparse", 0.01),
+#             w_transport=getattr(args, "w_transport", 0.02),
+#             w_cf=getattr(args, "w_cf", 0.05),
+#             w_var=getattr(args, "w_var", 0.005),
+#         )
+#
+#     def _text_mask_from_input(self, text, text_mask=None):
+#         if text_mask is not None:
+#             return build_sequence_mask(text[:, 1, :], text_mask)
+#         return build_sequence_mask(text[:, 1, :])
+#
+#     def _encode_modalities(self, text, audio, video, text_mask, audio_mask, video_mask):
+#         t = self.bert(text) if self.use_bert else text
+#
+#         ht = self.stem_t(t) + self.mod_embed[0]
+#         ha = self.stem_a(audio) + self.mod_embed[1]
+#         hv = self.stem_v(video) + self.mod_embed[2]
+#
+#         ht = self.shared_encoder(ht, text_mask)
+#         ha = self.shared_encoder(ha, audio_mask)
+#         hv = self.shared_encoder(hv, video_mask)
+#
+#         ht = self.adapter_t(ht)
+#         ha = self.adapter_a(ha)
+#         hv = self.adapter_v(hv)
+#
+#         if text_mask is not None:
+#             ht = ht * text_mask.unsqueeze(-1).to(ht.dtype)
+#         if audio_mask is not None:
+#             ha = ha * audio_mask.unsqueeze(-1).to(ha.dtype)
+#         if video_mask is not None:
+#             hv = hv * video_mask.unsqueeze(-1).to(hv.dtype)
+#
+#         return ht, ha, hv
+#
+#     def _compose_role_repr(self, cons, conf, res, role_weights):
+#         role_stack = torch.stack([cons, conf, res], dim=1)
+#         weighted = (role_weights.unsqueeze(-1) * role_stack).sum(dim=1)
+#         return self.final_norm(weighted)
+#
+#     def _compose_modality_repr(self, pooled_t, pooled_a, pooled_v, modality_weights):
+#         mod_stack = torch.stack([pooled_t, pooled_a, pooled_v], dim=1)
+#         weighted = (modality_weights.unsqueeze(-1) * mod_stack).reshape(mod_stack.size(0), -1)
+#         return self.final_norm(self.mod_fuse(weighted))
+#
+#     def _predict_from_parts(self, pooled_t, pooled_a, pooled_v, cons, conf, res, mw, rw):
+#         modality_repr = self._compose_modality_repr(pooled_t, pooled_a, pooled_v, mw)
+#         role_repr = self._compose_role_repr(cons, conf, res, rw)
+#         fused = self.final_norm(modality_repr + role_repr)
+#         pred = self.ordinal_head(fused)
+#         return pred, fused
+#
+#     def _counterfactual_preds(self, pooled_t, pooled_a, pooled_v, cons, conf, res, mw, rw):
+#         z_t = torch.zeros_like(pooled_t)
+#         z_a = torch.zeros_like(pooled_a)
+#         z_v = torch.zeros_like(pooled_v)
+#         z_r = torch.zeros_like(cons)
+#
+#         factual, _ = self._predict_from_parts(pooled_t, pooled_a, pooled_v, cons, conf, res, mw, rw)
+#         factual_pred = factual["output_logit"]
+#
+#         # Important: all factual and counterfactual predictions use the same ordinal head.
+#         cf_t = self._predict_from_parts(z_t, pooled_a, pooled_v, cons, conf, res, mw, rw)[0]["output_logit"]
+#         cf_a = self._predict_from_parts(pooled_t, z_a, pooled_v, cons, conf, res, mw, rw)[0]["output_logit"]
+#         cf_v = self._predict_from_parts(pooled_t, pooled_a, z_v, cons, conf, res, mw, rw)[0]["output_logit"]
+#
+#         cf_cons = self._predict_from_parts(pooled_t, pooled_a, pooled_v, z_r, conf, res, mw, rw)[0]["output_logit"]
+#         cf_conf = self._predict_from_parts(pooled_t, pooled_a, pooled_v, cons, z_r, res, mw, rw)[0]["output_logit"]
+#         cf_res = self._predict_from_parts(pooled_t, pooled_a, pooled_v, cons, conf, z_r, mw, rw)[0]["output_logit"]
+#
+#         return factual_pred, (cf_t, cf_a, cf_v), (cf_cons, cf_conf, cf_res)
+#
+#     def forward(self, text, audio, video, text_mask=None, audio_mask=None, video_mask=None, labels=None):
+#         text_mask = self._text_mask_from_input(text, text_mask)
+#         audio_mask = build_sequence_mask(audio, audio_mask)
+#         video_mask = build_sequence_mask(video, video_mask)
+#
+#         ht, ha, hv = self._encode_modalities(text, audio, video, text_mask, audio_mask, video_mask)
+#
+#         text_ev = self.evidence_t(ht, text_mask)
+#         audio_ev = self.evidence_a(ha, audio_mask)
+#         video_ev = self.evidence_v(hv, video_mask)
+#
+#         transport_out = self.transport(text_ev, audio_ev, video_ev)
+#         cons, conf, res = self.role_experts(
+#             transport_out["consensus_bank"],
+#             transport_out["conflict_bank"],
+#             transport_out["residual_bank"],
+#         )
+#
+#         pooled_t = self.mod_proj_t(evidence_weighted_pool(text_ev))
+#         pooled_a = self.mod_proj_a(evidence_weighted_pool(audio_ev))
+#         pooled_v = self.mod_proj_v(evidence_weighted_pool(video_ev))
+#
+#         mod_unc = torch.stack([
+#             (text_ev["slot_weight"] * text_ev["uncertainty"]).sum(dim=-1),
+#             (audio_ev["slot_weight"] * audio_ev["uncertainty"]).sum(dim=-1),
+#             (video_ev["slot_weight"] * video_ev["uncertainty"]).sum(dim=-1),
+#         ], dim=-1)
+#
+#         # Role uncertainty is estimated from the energy-normalized bank uncertainty proxy.
+#         # Smaller consensus/conflict/residual evidence magnitudes imply larger uncertainty.
+#         role_energy = torch.stack([
+#             cons.abs().mean(dim=-1),
+#             conf.abs().mean(dim=-1),
+#             res.abs().mean(dim=-1),
+#         ], dim=-1)
+#         role_unc = 1.0 / (role_energy + 1e-6)
+#         role_unc = role_unc / role_unc.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+#
+#         modality_weights, role_weights, modality_logits, role_logits = self.router(
+#             pooled_t, pooled_a, pooled_v, mod_unc, cons, conf, res, role_unc
+#         )
+#
+#         main_out, fused = self._predict_from_parts(
+#             pooled_t, pooled_a, pooled_v, cons, conf, res, modality_weights, role_weights
+#         )
+#
+#         logit_t = self.unimodal_t(pooled_t)
+#         logit_a = self.unimodal_a(pooled_a)
+#         logit_v = self.unimodal_v(pooled_v)
+#         logit_cons = self.role_head_cons(cons)
+#         logit_conf = self.role_head_conf(conf)
+#         logit_res = self.role_head_res(res)
+#
+#         factual_pred, cf_mod_preds, cf_role_preds = self._counterfactual_preds(
+#             pooled_t, pooled_a, pooled_v, cons, conf, res, modality_weights, role_weights
+#         )
+#         modality_cf_target, modality_delta = self.router.counterfactual_targets(factual_pred, cf_mod_preds)
+#         role_cf_target, role_delta = self.router.counterfactual_targets(factual_pred, cf_role_preds)
+#
+#         output = {
+#             "output_logit": main_out["output_logit"],
+#             "ordinal_logits": main_out["ordinal_logits"],
+#             "ordinal_probs": main_out["ordinal_probs"],
+#             "predictive_variance": main_out["predictive_variance"],
+#             # Backward-compatible uncertainty interval proxy.
+#             "interval_width": main_out["predictive_variance"].clamp_min(1e-8).sqrt(),
+#             "logit_t": logit_t,
+#             "logit_a": logit_a,
+#             "logit_v": logit_v,
+#             "logit_consensus": logit_cons,
+#             "logit_conflict": logit_conf,
+#             "logit_residual": logit_res,
+#             "fused": fused,
+#             "consensus_repr": cons,
+#             "conflict_repr": conf,
+#             "residual_repr": res,
+#             "modality_weights": modality_weights,
+#             "role_weights": role_weights,
+#             "modality_logits": modality_logits,
+#             "role_logits": role_logits,
+#             "modality_uncertainty": mod_unc,
+#             "role_uncertainty": role_unc,
+#             "modality_cf_target": modality_cf_target.detach(),
+#             "role_cf_target": role_cf_target.detach(),
+#             "modality_delta": modality_delta.detach(),
+#             "role_delta": role_delta.detach(),
+#             "text_evidence": text_ev["evidence"],
+#             "audio_evidence": audio_ev["evidence"],
+#             "video_evidence": video_ev["evidence"],
+#             "text_polarity": text_ev["polarity"],
+#             "audio_polarity": audio_ev["polarity"],
+#             "video_polarity": video_ev["polarity"],
+#             "text_strength": text_ev["strength"],
+#             "audio_strength": audio_ev["strength"],
+#             "video_strength": video_ev["strength"],
+#             "text_uncertainty": text_ev["uncertainty"],
+#             "audio_uncertainty": audio_ev["uncertainty"],
+#             "video_uncertainty": video_ev["uncertainty"],
+#             "text_reliability": text_ev["reliability"],
+#             "audio_reliability": audio_ev["reliability"],
+#             "video_reliability": video_ev["reliability"],
+#             "text_slot_weight": text_ev["slot_weight"],
+#             "audio_slot_weight": audio_ev["slot_weight"],
+#             "video_slot_weight": video_ev["slot_weight"],
+#             "text_tau": text_ev["tau"],
+#             "audio_tau": audio_ev["tau"],
+#             "video_tau": video_ev["tau"],
+#             "text_attn": text_ev["attn"],
+#             "audio_attn": audio_ev["attn"],
+#             "video_attn": video_ev["attn"],
+#             "text_slot_sim": text_ev["slot_sim"],
+#             "audio_slot_sim": audio_ev["slot_sim"],
+#             "video_slot_sim": video_ev["slot_sim"],
+#             "consensus_bank": transport_out["consensus_bank"],
+#             "conflict_bank": transport_out["conflict_bank"],
+#             "residual_bank": transport_out["residual_bank"],
+#             "soft_role_prob": transport_out["soft_role_prob"],
+#             "transport_ta": transport_out["transport_ta"],
+#             "transport_tv": transport_out["transport_tv"],
+#             "cost_ta": transport_out["cost_ta"],
+#             "cost_tv": transport_out["cost_tv"],
+#             "sim_ta": transport_out["sim_ta"],
+#             "sim_tv": transport_out["sim_tv"],
+#         }
+#
+#         if "transport_av" in transport_out:
+#             output.update({
+#                 "transport_av": transport_out["transport_av"],
+#                 "cost_av": transport_out["cost_av"],
+#                 "sim_av": transport_out["sim_av"],
+#             })
+#
+#         if labels is not None:
+#             output["losses"] = self.loss_module(output, labels)
+#
+#         return output
