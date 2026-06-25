@@ -1,0 +1,1125 @@
+# """
+# CDEG-MSA: Counterfactual Disentangled Evidence Graph
+# for multimodal sentiment analysis.
+#
+# This implementation follows the same coding style as the previous DMRL model,
+# while keeping the new architecture independent from DMRL compatibility wrappers.
+#
+# Main design:
+# 1. Modality-specific stems + shared Transformer encoder
+# 2. Dynamic sparse causal evidence tokenizer
+# 3. Tri-factor evidence disentanglement: sentiment / private / noise
+# 4. Signed evidence graph with consensus / conflict / compensation relations
+# 5. Node-level and edge-level counterfactual evidence calibration
+# 6. Ordinal distribution head with predictive variance
+#
+# Inputs:
+# - text:  if use_bert=True, shape [B, 3, Lt], where
+#          text[:, 0, :] = input_ids,
+#          text[:, 1, :] = attention_mask,
+#          text[:, 2, :] = token_type_ids.
+#          if use_bert=False, shape [B, Lt, Dt].
+# - audio: [B, La, Da]
+# - video: [B, Lv, Dv]
+# - labels: [B] or [B, 1], continuous sentiment labels, e.g. in [-3, 3].
+# """
+#
+# import os
+# os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+try:
+    from transformers import BertModel, BertTokenizer, RobertaModel, RobertaTokenizer
+except Exception:  # pragma: no cover
+    BertModel = BertTokenizer = RobertaModel = RobertaTokenizer = None
+
+
+ORDINAL_ANCHORS = (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0)
+
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class CDEGConfig:
+    # Input feature dimensions. If use_bert=True, text dim is overwritten by BERT hidden size.
+    feature_dims: Tuple[int, int, int] = (768, 74, 35)
+    d_model: int = 128
+    dropout: float = 0.1
+
+    # Text encoder.
+    use_bert: bool = True
+    use_finetune: bool = True
+    transformers: str = "bert"  # "bert" or "roberta"
+    pretrained: str = "bert-base-uncased"
+
+    # Modality encoder.
+    n_layers: int = 2
+    n_heads: int = 4
+    ff_mult: int = 4
+
+    # Evidence tokenizer.
+    k_max: int = 6
+    topk_attn: int = 0  # 0 means no hard top-k pruning.
+    evidence_gate_tau: float = 0.67
+    hard_evidence_gate: bool = False
+    gate_threshold: float = 0.5
+
+    # Signed graph.
+    graph_layers: int = 2
+    graph_cross_only: bool = False
+    graph_temperature: float = 0.5
+    lambda_time: float = 0.5
+    lambda_polarity: float = 1.0
+    lambda_uncertainty: float = 0.4
+
+    # Counterfactual target construction.
+    compute_node_cf: bool = True
+    edge_cf_mode: str = "proxy"  # "proxy" keeps training efficient.
+
+    # Loss weights.
+    w_main: float = 1.0
+    w_ord: float = 0.2
+    w_uni: float = 0.15
+    w_disentangle: float = 0.02
+    w_sparse: float = 0.005
+    w_graph: float = 0.02
+    w_cf_node: float = 0.05
+    w_cf_edge: float = 0.02
+    w_unc: float = 0.005
+
+
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
+
+
+def build_sequence_mask(x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Build boolean mask [B, T], True means valid."""
+    if mask is not None:
+        seq_mask = mask.bool()
+    elif x.dim() == 3:
+        seq_mask = (x.abs().sum(dim=-1) > 0).bool()
+    else:
+        seq_mask = (x > 0).bool()
+
+    if seq_mask.dim() == 2:
+        empty_rows = ~seq_mask.any(dim=1)
+        if empty_rows.any():
+            seq_mask = seq_mask.clone()
+            seq_mask[empty_rows, 0] = True
+    return seq_mask
+
+
+def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Masked mean pooling for [B, T, D]."""
+    w = mask.unsqueeze(-1).to(x.dtype)
+    return (x * w).sum(dim=1) / w.sum(dim=1).clamp_min(1e-6)
+
+
+def masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    logits = logits.masked_fill(~mask.bool(), -1e4)
+    probs = F.softmax(logits, dim=dim)
+    probs = probs * mask.to(probs.dtype)
+    return probs / probs.sum(dim=dim, keepdim=True).clamp_min(1e-6)
+
+
+def gumbel_sigmoid(
+    logits: torch.Tensor,
+    tau: float = 1.0,
+    hard: bool = False,
+    training: bool = True,
+    threshold: float = 0.5,
+) -> torch.Tensor:
+    """Differentiable binary gate using Binary Concrete / Gumbel-Sigmoid."""
+    if training:
+        eps = 1e-10
+        u = torch.rand_like(logits).clamp_(eps, 1.0 - eps)
+        g = torch.log(u) - torch.log(1.0 - u)
+        y = torch.sigmoid((logits + g) / max(tau, 1e-6))
+        if hard:
+            y_hard = (y > threshold).to(y.dtype)
+            y = y_hard.detach() - y.detach() + y
+        return y
+    return (torch.sigmoid(logits) > threshold).to(logits.dtype) if hard else torch.sigmoid(logits)
+
+
+def entropy(probs: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    return -(probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()).sum(dim=dim)
+
+
+def offdiag_mean_square(sim: torch.Tensor) -> torch.Tensor:
+    """Mean squared off-diagonal similarity for slot diversity."""
+    k = sim.size(-1)
+    eye = torch.eye(k, device=sim.device, dtype=sim.dtype).unsqueeze(0)
+    off = 1.0 - eye
+    return ((sim * off) ** 2).sum() / off.sum().clamp_min(1.0) / sim.size(0)
+
+
+def normalize_with_mask(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    x = x * mask.to(x.dtype)
+    return x / x.sum(dim=dim, keepdim=True).clamp_min(1e-6)
+
+
+def masked_kl_div(pred_prob: torch.Tensor, target_prob: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """KL(target || pred) with mask. Inputs are probabilities."""
+    mask = mask.to(pred_prob.dtype)
+    pred = normalize_with_mask(pred_prob.clamp_min(1e-8), mask, dim=-1)
+    target = normalize_with_mask(target_prob.clamp_min(1e-8), mask, dim=-1).detach()
+    kl = target * (target.clamp_min(1e-8).log() - pred.clamp_min(1e-8).log())
+    return (kl * mask).sum(dim=-1).mean()
+
+
+# -----------------------------------------------------------------------------
+# Text encoder and modality encoders
+# -----------------------------------------------------------------------------
+
+
+TRANSFORMERS_MAP = {
+    "bert": (BertTokenizer, BertModel),
+    "roberta": (RobertaTokenizer, RobertaModel),
+}
+
+
+class BertTextEncoder(nn.Module):
+    """BERT/RoBERTa text encoder returning token-level features [B, Lt, H]."""
+
+    def __init__(self, use_finetune: bool = True, transformers: str = "bert", pretrained: str = "bert-base-uncased"):
+        super().__init__()
+        if BertModel is None:
+            raise ImportError("transformers is required when use_bert=True. Install with `pip install transformers`.")
+        tokenizer_class, model_class = TRANSFORMERS_MAP[transformers]
+        self.tokenizer = tokenizer_class.from_pretrained(pretrained)
+        self.model = model_class.from_pretrained(pretrained)
+        self.use_finetune = use_finetune
+        self.transformers = transformers
+        self.hidden_size = self.model.config.hidden_size
+
+    def forward(self, text: torch.Tensor) -> torch.Tensor:
+        input_ids = text[:, 0, :].long()
+        input_mask = text[:, 1, :].long()
+        segment_ids = text[:, 2, :].long()
+
+        kwargs = {"input_ids": input_ids, "attention_mask": input_mask}
+        if self.transformers == "bert":
+            kwargs["token_type_ids"] = segment_ids
+
+        if self.use_finetune:
+            return self.model(**kwargs).last_hidden_state
+        with torch.no_grad():
+            return self.model(**kwargs).last_hidden_state
+
+
+class MultiScaleTemporalStem(nn.Module):
+    """Parallel multi-scale Conv1d stem with residual projection."""
+
+    def __init__(self, d_in: int, d_model: int, kernels: Sequence[int] = (1, 3, 5), dropout: float = 0.1):
+        super().__init__()
+        branch_dim = d_model
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(d_in, branch_dim, kernel_size=k, padding=k // 2, bias=False),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            for k in kernels
+        ])
+        self.out_proj = nn.Linear(branch_dim * len(kernels), d_model)
+        self.res_proj = nn.Linear(d_in, d_model) if d_in != d_model else nn.Identity()
+        self.norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.res_proj(x)
+        x_t = x.transpose(1, 2)
+        feats = [branch(x_t).transpose(1, 2) for branch in self.branches]
+        h = self.out_proj(torch.cat(feats, dim=-1))
+        return self.norm(self.drop(h) + residual)
+
+
+class MaskedTransformerEncoder(nn.Module):
+    """Stacked mask-aware Transformer encoder."""
+
+    def __init__(self, d_model: int, n_layers: int = 2, n_heads: int = 4, ff_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=d_model * ff_mult,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(n_layers)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is not None:
+            x = x * mask.unsqueeze(-1).to(x.dtype)
+        key_padding_mask = ~mask.bool() if mask is not None else None
+        for layer in self.layers:
+            x = layer(x, src_key_padding_mask=key_padding_mask)
+            if mask is not None:
+                x = x * mask.unsqueeze(-1).to(x.dtype)
+        x = self.norm(x)
+        if mask is not None:
+            x = x * mask.unsqueeze(-1).to(x.dtype)
+        return x
+
+
+# -----------------------------------------------------------------------------
+# Innovation 1: Dynamic Causal Disentangled Evidence Tokenizer
+# -----------------------------------------------------------------------------
+
+
+class DynamicCausalEvidenceTokenizer(nn.Module):
+    """Dynamic sparse evidence tokenizer with tri-factor disentanglement.
+
+    Produces K_max candidate evidence tokens and a differentiable gate for each token.
+    Downstream graph reasoning uses the sentiment evidence component by default.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        k_max: int = 6,
+        dropout: float = 0.1,
+        topk_attn: int = 0,
+        gate_tau: float = 0.67,
+        hard_gate: bool = False,
+        gate_threshold: float = 0.5,
+    ):
+        super().__init__()
+        self.k_max = k_max
+        self.topk_attn = topk_attn
+        self.gate_tau = gate_tau
+        self.hard_gate = hard_gate
+        self.gate_threshold = gate_threshold
+
+        self.slot_queries = nn.Parameter(torch.randn(1, k_max, d_model) * 0.02)
+        self.ctx_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.query_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+        self.query_norm = nn.LayerNorm(d_model)
+        self.key_norm = nn.LayerNorm(d_model)
+        self.value_proj = nn.Linear(d_model, d_model)
+
+        # Dynamic evidence existence gate.
+        self.slot_gate_head = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+
+        # Evidence attributes.
+        self.polarity_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Tanh())
+        self.strength_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Softplus())
+        self.uncertainty_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Softplus())
+        self.position_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Sigmoid())
+
+        # Tri-factor disentanglement.
+        def projector() -> nn.Sequential:
+            return nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model),
+            )
+
+        self.sentiment_proj = projector()
+        self.private_proj = projector()
+        self.noise_proj = projector()
+        self.factor_gate = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 3),
+        )
+        self.factor_norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def _sparse_attention(self, scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # scores: [B, K, T], mask: [B, T]
+        scores = scores.masked_fill(~mask.unsqueeze(1).bool(), -1e4)
+        if self.topk_attn is not None and self.topk_attn > 0 and self.topk_attn < scores.size(-1):
+            vals, idx = scores.topk(self.topk_attn, dim=-1)
+            sparse_scores = torch.full_like(scores, -1e4)
+            sparse_scores.scatter_(-1, idx, vals)
+            scores = sparse_scores
+        attn = F.softmax(scores, dim=-1)
+        attn = attn * mask.unsqueeze(1).to(attn.dtype)
+        return attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, modality_id: int = 0) -> Dict[str, torch.Tensor]:
+        B, T, D = x.shape
+        if mask is None:
+            mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+
+        global_ctx = masked_mean(x, mask)
+        base_q = self.slot_queries.expand(B, -1, -1)
+        ctx_q = self.ctx_proj(global_ctx).unsqueeze(1).expand(-1, self.k_max, -1)
+        q_gate = self.query_gate(torch.cat([base_q, ctx_q], dim=-1))
+        q = self.query_norm(base_q + q_gate * ctx_q)
+
+        # Dynamic token existence gate.
+        slot_gate_logits = self.slot_gate_head(torch.cat([q, ctx_q], dim=-1)).squeeze(-1)
+        slot_gate_prob = torch.sigmoid(slot_gate_logits)
+        slot_gate = gumbel_sigmoid(
+            slot_gate_logits,
+            tau=self.gate_tau,
+            hard=self.hard_gate,
+            training=self.training,
+            threshold=self.gate_threshold,
+        )
+
+        k = self.key_norm(x)
+        scores = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(D)
+        attn = self._sparse_attention(scores, mask)
+
+        raw_evidence = self.drop(torch.matmul(attn, self.value_proj(x)))  # [B, K, D]
+
+        polarity = self.polarity_head(raw_evidence).squeeze(-1)
+        strength = self.strength_head(raw_evidence).squeeze(-1)
+        uncertainty = self.uncertainty_head(raw_evidence).squeeze(-1)
+
+        pos_grid = torch.linspace(0.0, 1.0, T, device=x.device, dtype=x.dtype).view(1, 1, T)
+        attn_position = (attn * pos_grid).sum(dim=-1)
+        learned_position = self.position_head(raw_evidence).squeeze(-1)
+        tau = 0.5 * attn_position + 0.5 * learned_position
+
+        # Tri-factor evidence disentanglement.
+        z_sent = self.factor_norm(self.sentiment_proj(raw_evidence))
+        z_priv = self.factor_norm(self.private_proj(raw_evidence))
+        z_noise = self.factor_norm(self.noise_proj(raw_evidence))
+        factor_gate = F.softmax(self.factor_gate(raw_evidence), dim=-1)
+        g_sent, g_priv, g_noise = factor_gate[..., 0], factor_gate[..., 1], factor_gate[..., 2]
+
+        reconstructed = (
+            g_sent.unsqueeze(-1) * z_sent
+            + g_priv.unsqueeze(-1) * z_priv
+            + g_noise.unsqueeze(-1) * z_noise
+        )
+
+        # Reliability combines strength, uncertainty, evidence existence, and sentiment purity.
+        reliability = (
+            strength
+            - uncertainty
+            + torch.log(slot_gate_prob.clamp_min(1e-6))
+            + torch.log(g_sent.clamp_min(1e-6))
+            - 0.5 * torch.log(g_noise.clamp_min(1e-6))
+        )
+        slot_weight = F.softmax(reliability, dim=-1)
+
+        sent_norm = F.normalize(z_sent, dim=-1, eps=1e-6)
+        slot_sim = torch.matmul(sent_norm, sent_norm.transpose(1, 2))
+
+        modality_ids = torch.full((B, self.k_max), int(modality_id), device=x.device, dtype=torch.long)
+
+        return {
+            "evidence": z_sent,
+            "raw_evidence": raw_evidence,
+            "sentiment_evidence": z_sent,
+            "private_evidence": z_priv,
+            "noise_evidence": z_noise,
+            "reconstructed_evidence": reconstructed,
+            "factor_gate": factor_gate,
+            "slot_gate": slot_gate,
+            "slot_gate_prob": slot_gate_prob,
+            "slot_gate_logits": slot_gate_logits,
+            "slot_weight": slot_weight,
+            "polarity": polarity,
+            "strength": strength,
+            "uncertainty": uncertainty,
+            "reliability": reliability,
+            "tau": tau,
+            "attn": attn,
+            "slot_sim": slot_sim,
+            "modality_ids": modality_ids,
+        }
+
+
+# -----------------------------------------------------------------------------
+# Innovation 2: Signed Counterfactual Evidence Graph
+# -----------------------------------------------------------------------------
+
+
+class SignedEvidenceGraphBuilder(nn.Module):
+    """Build a signed evidence graph over sentiment evidence tokens.
+
+    Edge roles:
+    - 0: consensus
+    - 1: conflict
+    - 2: compensation / residual
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        temperature: float = 0.5,
+        cross_only: bool = False,
+        lambda_time: float = 0.5,
+        lambda_polarity: float = 1.0,
+        lambda_uncertainty: float = 0.4,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.cross_only = cross_only
+        self.lambda_time = lambda_time
+        self.lambda_polarity = lambda_polarity
+        self.lambda_uncertainty = lambda_uncertainty
+
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(d_model * 2 + 6, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 3),
+        )
+
+    @staticmethod
+    def _concat_ev(text_ev: Dict[str, torch.Tensor], audio_ev: Dict[str, torch.Tensor], video_ev: Dict[str, torch.Tensor]):
+        nodes = torch.cat([text_ev["sentiment_evidence"], audio_ev["sentiment_evidence"], video_ev["sentiment_evidence"]], dim=1)
+        gates = torch.cat([text_ev["slot_gate_prob"], audio_ev["slot_gate_prob"], video_ev["slot_gate_prob"]], dim=1)
+        polarity = torch.cat([text_ev["polarity"], audio_ev["polarity"], video_ev["polarity"]], dim=1)
+        strength = torch.cat([text_ev["strength"], audio_ev["strength"], video_ev["strength"]], dim=1)
+        uncertainty = torch.cat([text_ev["uncertainty"], audio_ev["uncertainty"], video_ev["uncertainty"]], dim=1)
+        tau = torch.cat([text_ev["tau"], audio_ev["tau"], video_ev["tau"]], dim=1)
+        modality_ids = torch.cat([text_ev["modality_ids"], audio_ev["modality_ids"], video_ev["modality_ids"]], dim=1)
+        return nodes, gates, polarity, strength, uncertainty, tau, modality_ids
+
+    def forward(self, text_ev: Dict[str, torch.Tensor], audio_ev: Dict[str, torch.Tensor], video_ev: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        nodes, gates, polarity, strength, uncertainty, tau, modality_ids = self._concat_ev(text_ev, audio_ev, video_ev)
+        B, N, D = nodes.shape
+
+        node_norm = F.normalize(nodes, dim=-1, eps=1e-6)
+        sim = torch.matmul(node_norm, node_norm.transpose(1, 2))
+
+        pol_i = polarity.unsqueeze(2)
+        pol_j = polarity.unsqueeze(1)
+        str_i = strength.unsqueeze(2)
+        str_j = strength.unsqueeze(1)
+        unc_i = uncertainty.unsqueeze(2)
+        unc_j = uncertainty.unsqueeze(1)
+        tau_i = tau.unsqueeze(2)
+        tau_j = tau.unsqueeze(1)
+
+        polar_gap = (pol_i - pol_j).abs()
+        opposite = F.relu(-(pol_i * pol_j))
+        same = F.relu(pol_i * pol_j)
+        strength_pair = 0.5 * (str_i + str_j)
+        unc_pair = 0.5 * (unc_i + unc_j)
+        time_dist = (tau_i - tau_j).abs()
+
+        mod_i = modality_ids.unsqueeze(2)
+        mod_j = modality_ids.unsqueeze(1)
+        cross_mod = (mod_i != mod_j)
+
+        eye = torch.eye(N, device=nodes.device, dtype=torch.bool).unsqueeze(0)
+        node_pair = gates.unsqueeze(2) * gates.unsqueeze(1)
+        edge_mask = (~eye).to(nodes.dtype) * node_pair
+        if self.cross_only:
+            edge_mask = edge_mask * cross_mod.to(edge_mask.dtype)
+
+        # Analytic role priors.
+        base = sim + 0.15 * strength_pair - self.lambda_time * time_dist - self.lambda_uncertainty * unc_pair
+        cons_prior = base + self.lambda_polarity * same - self.lambda_polarity * polar_gap
+        conf_prior = base + self.lambda_polarity * opposite + 0.3 * polar_gap
+        comp_prior = -sim.abs() + 0.2 * strength_pair + 0.4 * unc_pair - 0.2 * time_dist
+        analytic_logits = torch.stack([cons_prior, conf_prior, comp_prior], dim=-1)
+
+        # Learned correction.
+        hi = nodes.unsqueeze(2).expand(-1, -1, N, -1)
+        hj = nodes.unsqueeze(1).expand(-1, N, -1, -1)
+        scalar_feats = torch.stack([sim, polar_gap, opposite, strength_pair, unc_pair, time_dist], dim=-1)
+        learned_logits = self.edge_mlp(torch.cat([hi, hj, scalar_feats], dim=-1))
+
+        edge_logits = analytic_logits + learned_logits
+        role_prob = F.softmax(edge_logits / max(self.temperature, 1e-6), dim=-1)
+        role_prob = role_prob * edge_mask.unsqueeze(-1)
+
+        # Row-normalized adjacency for message passing.
+        A = role_prob / role_prob.sum(dim=2, keepdim=True).clamp_min(1e-6)
+
+        edge_importance = role_prob.sum(dim=-1)
+        edge_importance = edge_importance / edge_importance.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+
+        # Self-supervised pseudo edge type for a light graph-structure regularizer.
+        # 0: same polarity and semantically aligned; 1: opposite polarity but semantically aligned; 2: weak/uncertain.
+        pseudo_scores = torch.stack([
+            sim.detach() + same.detach() - polar_gap.detach(),
+            sim.detach() + opposite.detach() + polar_gap.detach(),
+            -sim.detach().abs() + unc_pair.detach(),
+        ], dim=-1)
+        pseudo_target = pseudo_scores.argmax(dim=-1)
+
+        return {
+            "nodes": nodes,
+            "node_gate": gates,
+            "polarity": polarity,
+            "strength": strength,
+            "uncertainty": uncertainty,
+            "tau": tau,
+            "modality_ids": modality_ids,
+            "sim": sim,
+            "edge_mask": edge_mask,
+            "edge_logits": edge_logits,
+            "edge_role_prob": role_prob,
+            "adjacency": A,
+            "edge_importance": edge_importance,
+            "edge_pseudo_target": pseudo_target,
+        }
+
+
+class SignedEvidenceGraphReasoner(nn.Module):
+    """Signed message passing over consensus/conflict/compensation edges."""
+
+    def __init__(self, d_model: int, n_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.pos_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        self.neg_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        self.comp_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        self.update = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model * 4, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model),
+            )
+            for _ in range(n_layers)
+        ])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
+        self.node_score = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+        )
+        self.graph_fuse = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def message_passing(self, h: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+        # adjacency: [B, N, N, 3]. A[i,j,r] sends message from j to i under role r.
+        for layer in range(self.n_layers):
+            A_pos = adjacency[..., 0]
+            A_neg = adjacency[..., 1]
+            A_comp = adjacency[..., 2]
+
+            msg_pos = torch.matmul(A_pos, self.pos_proj[layer](h))
+            msg_neg = torch.matmul(A_neg, self.neg_proj[layer](h))
+            msg_comp = torch.matmul(A_comp, self.comp_proj[layer](h))
+
+            upd = self.update[layer](torch.cat([h, msg_pos, msg_neg, msg_comp], dim=-1))
+            h = self.norms[layer](h + upd)
+        return h
+
+    def pool_graph(
+        self,
+        h: torch.Tensor,
+        edge_role_prob: torch.Tensor,
+        node_gate: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        # Role-specific node energy: outgoing + incoming role mass.
+        role_energy = edge_role_prob.sum(dim=2) + edge_role_prob.sum(dim=1)  # [B, N, 3]
+        role_weight = role_energy * node_gate.unsqueeze(-1)
+        role_weight = role_weight / role_weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        z_cons = (role_weight[..., 0:1] * h).sum(dim=1)
+        z_conf = (role_weight[..., 1:2] * h).sum(dim=1)
+        z_comp = (role_weight[..., 2:3] * h).sum(dim=1)
+        graph_repr = self.graph_fuse(torch.cat([z_cons, z_conf, z_comp], dim=-1))
+
+        node_logits = self.node_score(h).squeeze(-1) + torch.log(node_gate.clamp_min(1e-6))
+        node_importance = F.softmax(node_logits, dim=-1)
+        node_importance = node_importance * node_gate
+        node_importance = node_importance / node_importance.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        return graph_repr, {
+            "z_consensus": z_cons,
+            "z_conflict": z_conf,
+            "z_compensation": z_comp,
+            "role_node_weight": role_weight,
+            "node_importance": node_importance,
+        }
+
+    def forward(self, graph: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        h0 = graph["nodes"]
+        h = self.message_passing(h0, graph["adjacency"])
+        graph_repr, pooled = self.pool_graph(h, graph["edge_role_prob"], graph["node_gate"])
+
+        # Efficient edge counterfactual proxy: message magnitude carried by each edge.
+        # This acts as a differentiable target proxy for edge-level contribution.
+        sender = h.unsqueeze(1)  # [B, 1, N, D]
+        receiver = h.unsqueeze(2)  # [B, N, 1, D]
+        edge_msg = graph["edge_role_prob"].sum(dim=-1) * (sender - receiver).norm(dim=-1)
+        edge_cf_target = edge_msg.detach()
+        edge_cf_target = edge_cf_target / edge_cf_target.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+
+        return {
+            **graph,
+            **pooled,
+            "node_hidden": h,
+            "graph_repr": graph_repr,
+            "edge_cf_target": edge_cf_target,
+        }
+
+
+# -----------------------------------------------------------------------------
+# Prediction heads
+# -----------------------------------------------------------------------------
+
+
+class OrdinalDistributionHead(nn.Module):
+    """Ordinal distribution head over sentiment anchors."""
+
+    def __init__(self, d_model: int, anchors: Sequence[float] = ORDINAL_ANCHORS, dropout: float = 0.1):
+        super().__init__()
+        self.register_buffer("anchors", torch.tensor(anchors).float())
+        self.ordinal_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, len(anchors)),
+        )
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        logits = self.ordinal_head(x)
+        probs = F.softmax(logits, dim=-1)
+        anchors = self.anchors.unsqueeze(0).to(probs.device)
+        sentiment = (probs * anchors).sum(dim=-1, keepdim=True)
+        variance = (probs * (anchors - sentiment) ** 2).sum(dim=-1, keepdim=True)
+        return {
+            "ordinal_logits": logits,
+            "ordinal_probs": probs,
+            "output_logit": sentiment,
+            "predictive_variance": variance,
+        }
+
+
+class RegressionHead(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# -----------------------------------------------------------------------------
+# Loss
+# -----------------------------------------------------------------------------
+
+
+class CDEGLoss(nn.Module):
+    def __init__(self, cfg: CDEGConfig, anchors: Sequence[float] = ORDINAL_ANCHORS):
+        super().__init__()
+        self.cfg = cfg
+        self.register_buffer("anchors", torch.tensor(anchors).float())
+        self.l1 = nn.L1Loss()
+
+    @staticmethod
+    def _labels(labels: torch.Tensor) -> torch.Tensor:
+        return labels.view(-1, 1).float()
+
+    def soft_ordinal_target(self, labels: torch.Tensor) -> torch.Tensor:
+        labels = self._labels(labels).to(self.anchors.device)
+        anchors = self.anchors.view(1, -1)
+        dist = torch.exp(-((labels - anchors) ** 2) / 2.0)
+        return dist / dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def ordinal_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        target = self.soft_ordinal_target(labels).to(logits.device)
+        return -(target * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+
+    @staticmethod
+    def _orthogonality_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        a = F.normalize(a, dim=-1, eps=1e-6)
+        b = F.normalize(b, dim=-1, eps=1e-6)
+        return (a * b).sum(dim=-1).pow(2).mean()
+
+    def disentangle_regularization(self, out: Dict[str, torch.Tensor]) -> torch.Tensor:
+        terms = []
+        for key in ("text", "audio", "video"):
+            raw = out[f"{key}_raw_evidence"]
+            z_sent = out[f"{key}_sentiment_evidence"]
+            z_priv = out[f"{key}_private_evidence"]
+            z_noise = out[f"{key}_noise_evidence"]
+            recon = out[f"{key}_reconstructed_evidence"]
+            factor_gate = out[f"{key}_factor_gate"]
+            uncertainty = out[f"{key}_uncertainty"]
+
+            recon_loss = F.mse_loss(recon, raw.detach())
+            orth_loss = (
+                self._orthogonality_loss(z_sent, z_priv)
+                + self._orthogonality_loss(z_sent, z_noise)
+                + self._orthogonality_loss(z_priv, z_noise)
+            ) / 3.0
+
+            noise_gate = factor_gate[..., 2]
+            unc_target = uncertainty / uncertainty.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+            unc_target = unc_target / unc_target.max(dim=-1, keepdim=True).values.clamp_min(1e-6)
+            noise_align = F.mse_loss(noise_gate, unc_target.detach())
+
+            # Encourage sentiment branch to be selected when slot reliability is high.
+            sent_gate = factor_gate[..., 0]
+            reliability = out[f"{key}_reliability"].detach()
+            rel_target = F.softmax(reliability, dim=-1)
+            sent_align = F.mse_loss(sent_gate, rel_target)
+
+            terms.append(recon_loss + orth_loss + 0.5 * noise_align + 0.2 * sent_align)
+        return sum(terms) / len(terms)
+
+    def sparse_regularization(self, out: Dict[str, torch.Tensor]) -> torch.Tensor:
+        terms = []
+        for key in ("text", "audio", "video"):
+            attn = out[f"{key}_attn"]
+            gate_prob = out[f"{key}_slot_gate_prob"]
+            slot_sim = out[f"{key}_slot_sim"]
+            slot_weight = out[f"{key}_slot_weight"]
+
+            attn_entropy = entropy(attn, dim=-1).mean()
+            slot_entropy = entropy(slot_weight, dim=-1).mean()
+            gate_l0 = gate_prob.mean()
+            diversity = offdiag_mean_square(slot_sim)
+            terms.append(attn_entropy + 0.5 * slot_entropy + 0.5 * gate_l0 + 0.5 * diversity)
+        return sum(terms) / len(terms)
+
+    def graph_structure_loss(self, out: Dict[str, torch.Tensor]) -> torch.Tensor:
+        logits = out["edge_logits"]  # [B,N,N,3]
+        target = out["edge_pseudo_target"]  # [B,N,N]
+        mask = out["edge_mask"].to(logits.dtype)
+        ce = F.cross_entropy(logits.permute(0, 3, 1, 2), target, reduction="none")
+        return (ce * mask).sum() / mask.sum().clamp_min(1.0)
+
+    def counterfactual_node_loss(self, out: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return masked_kl_div(out["node_importance"], out["node_cf_target"], out["node_mask"])
+
+    def counterfactual_edge_loss(self, out: Dict[str, torch.Tensor]) -> torch.Tensor:
+        B, N, _ = out["edge_importance"].shape
+        pred = out["edge_importance"].view(B, -1)
+        target = out["edge_cf_target"].view(B, -1)
+        mask = out["edge_mask"].view(B, -1)
+        return masked_kl_div(pred, target, mask)
+
+    def uncertainty_calibration_loss(self, out: Dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+        labels = self._labels(labels).to(out["output_logit"].device)
+        err2 = (out["output_logit"] - labels).pow(2).detach()
+        return self.l1(out["predictive_variance"], err2)
+
+    def forward(self, out: Dict[str, torch.Tensor], labels: torch.Tensor) -> Dict[str, torch.Tensor]:
+        labels = self._labels(labels).to(out["output_logit"].device)
+        losses = {}
+        losses["main_loss"] = self.l1(out["output_logit"], labels)
+        losses["ordinal_loss"] = self.ordinal_loss(out["ordinal_logits"], labels)
+        losses["unimodal_loss"] = (
+            self.l1(out["logit_t"], labels)
+            + self.l1(out["logit_a"], labels)
+            + self.l1(out["logit_v"], labels)
+        ) / 3.0
+        losses["disentangle_loss"] = self.disentangle_regularization(out)
+        losses["sparse_loss"] = self.sparse_regularization(out)
+        losses["graph_loss"] = self.graph_structure_loss(out)
+        losses["cf_node_loss"] = self.counterfactual_node_loss(out)
+        losses["cf_edge_loss"] = self.counterfactual_edge_loss(out)
+        losses["uncertainty_loss"] = self.uncertainty_calibration_loss(out, labels)
+        losses["variance_loss"] = losses["uncertainty_loss"]  # backward-compatible alias
+
+        cfg = self.cfg
+        losses["total_loss"] = (
+            cfg.w_main * losses["main_loss"]
+            + cfg.w_ord * losses["ordinal_loss"]
+            + cfg.w_uni * losses["unimodal_loss"]
+            + cfg.w_disentangle * losses["disentangle_loss"]
+            + cfg.w_sparse * losses["sparse_loss"]
+            + cfg.w_graph * losses["graph_loss"]
+            + cfg.w_cf_node * losses["cf_node_loss"]
+            + cfg.w_cf_edge * losses["cf_edge_loss"]
+            + cfg.w_unc * losses["uncertainty_loss"]
+        )
+        return losses
+
+
+# -----------------------------------------------------------------------------
+# Full model
+# -----------------------------------------------------------------------------
+
+
+class CDEG_MSA(nn.Module):
+    """Counterfactual Disentangled Evidence Graph for MSA."""
+
+    def __init__(self, cfg: CDEGConfig):
+        super().__init__()
+        self.cfg = cfg
+        d_t, d_a, d_v = cfg.feature_dims
+
+        self.use_bert = cfg.use_bert
+        if self.use_bert:
+            self.bert = BertTextEncoder(
+                use_finetune=cfg.use_finetune,
+                transformers=cfg.transformers,
+                pretrained=cfg.pretrained,
+            )
+            d_t = self.bert.hidden_size
+
+        self.stem_t = MultiScaleTemporalStem(d_t, cfg.d_model, dropout=cfg.dropout)
+        self.stem_a = MultiScaleTemporalStem(d_a, cfg.d_model, dropout=cfg.dropout)
+        self.stem_v = MultiScaleTemporalStem(d_v, cfg.d_model, dropout=cfg.dropout)
+
+        self.mod_embed = nn.Parameter(torch.randn(3, 1, cfg.d_model) * 0.02)
+        self.shared_encoder = MaskedTransformerEncoder(
+            d_model=cfg.d_model,
+            n_layers=cfg.n_layers,
+            n_heads=cfg.n_heads,
+            ff_mult=cfg.ff_mult,
+            dropout=cfg.dropout,
+        )
+        self.adapter_t = nn.Sequential(nn.LayerNorm(cfg.d_model), nn.Linear(cfg.d_model, cfg.d_model), nn.GELU())
+        self.adapter_a = nn.Sequential(nn.LayerNorm(cfg.d_model), nn.Linear(cfg.d_model, cfg.d_model), nn.GELU())
+        self.adapter_v = nn.Sequential(nn.LayerNorm(cfg.d_model), nn.Linear(cfg.d_model, cfg.d_model), nn.GELU())
+
+        # Use separate tokenizers so each modality can learn its own evidence patterns.
+        tok_kwargs = dict(
+            d_model=cfg.d_model,
+            k_max=cfg.k_max,
+            dropout=cfg.dropout,
+            topk_attn=cfg.topk_attn,
+            gate_tau=cfg.evidence_gate_tau,
+            hard_gate=cfg.hard_evidence_gate,
+            gate_threshold=cfg.gate_threshold,
+        )
+        self.evidence_t = DynamicCausalEvidenceTokenizer(**tok_kwargs)
+        self.evidence_a = DynamicCausalEvidenceTokenizer(**tok_kwargs)
+        self.evidence_v = DynamicCausalEvidenceTokenizer(**tok_kwargs)
+
+        self.graph_builder = SignedEvidenceGraphBuilder(
+            d_model=cfg.d_model,
+            temperature=cfg.graph_temperature,
+            cross_only=cfg.graph_cross_only,
+            lambda_time=cfg.lambda_time,
+            lambda_polarity=cfg.lambda_polarity,
+            lambda_uncertainty=cfg.lambda_uncertainty,
+        )
+        self.graph_reasoner = SignedEvidenceGraphReasoner(cfg.d_model, n_layers=cfg.graph_layers, dropout=cfg.dropout)
+        self.ordinal_head = OrdinalDistributionHead(cfg.d_model, dropout=cfg.dropout)
+
+        self.uni_t = RegressionHead(cfg.d_model, dropout=cfg.dropout)
+        self.uni_a = RegressionHead(cfg.d_model, dropout=cfg.dropout)
+        self.uni_v = RegressionHead(cfg.d_model, dropout=cfg.dropout)
+
+        self.loss_fn = CDEGLoss(cfg)
+
+    def _text_mask_from_input(self, text: torch.Tensor, text_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if text_mask is not None:
+            return build_sequence_mask(text[:, 1, :] if self.use_bert else text, text_mask)
+        if self.use_bert:
+            return build_sequence_mask(text[:, 1, :])
+        return build_sequence_mask(text)
+
+    def _encode_modalities(
+        self,
+        text: torch.Tensor,
+        audio: torch.Tensor,
+        video: torch.Tensor,
+        text_mask: torch.Tensor,
+        audio_mask: torch.Tensor,
+        video_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        t = self.bert(text) if self.use_bert else text
+
+        ht = self.stem_t(t) + self.mod_embed[0]
+        ha = self.stem_a(audio) + self.mod_embed[1]
+        hv = self.stem_v(video) + self.mod_embed[2]
+
+        ht = self.shared_encoder(ht, text_mask)
+        ha = self.shared_encoder(ha, audio_mask)
+        hv = self.shared_encoder(hv, video_mask)
+
+        ht = ht + self.adapter_t(ht)
+        ha = ha + self.adapter_a(ha)
+        hv = hv + self.adapter_v(hv)
+
+        ht = ht * text_mask.unsqueeze(-1).to(ht.dtype)
+        ha = ha * audio_mask.unsqueeze(-1).to(ha.dtype)
+        hv = hv * video_mask.unsqueeze(-1).to(hv.dtype)
+        return ht, ha, hv
+
+    @staticmethod
+    def _evidence_pool(ev: Dict[str, torch.Tensor]) -> torch.Tensor:
+        w = ev["slot_weight"].unsqueeze(-1)
+        return (w * ev["sentiment_evidence"]).sum(dim=1)
+
+    @staticmethod
+    def _prefix_evidence(prefix: str, ev: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        keys = [
+            "evidence", "raw_evidence", "sentiment_evidence", "private_evidence", "noise_evidence",
+            "reconstructed_evidence", "factor_gate", "slot_gate", "slot_gate_prob", "slot_gate_logits",
+            "slot_weight", "polarity", "strength", "uncertainty", "reliability", "tau", "attn", "slot_sim",
+        ]
+        return {f"{prefix}_{k}": ev[k] for k in keys}
+
+    def _node_counterfactual_target(
+        self,
+        graph_out: Dict[str, torch.Tensor],
+        factual_pred: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute node-level counterfactual target by removing each evidence node from pooling.
+
+        This keeps graph message passing fixed for efficiency and recomputes only graph pooling
+        and the ordinal head for each node intervention.
+        """
+        h = graph_out["node_hidden"]
+        edge_role_prob = graph_out["edge_role_prob"]
+        node_gate = graph_out["node_gate"]
+        B, N, _ = h.shape
+        deltas = []
+        for idx in range(N):
+            cf_gate = node_gate.clone()
+            cf_gate[:, idx] = 0.0
+            cf_repr, _ = self.graph_reasoner.pool_graph(h, edge_role_prob, cf_gate)
+            cf_pred = self.ordinal_head(cf_repr)["output_logit"]
+            deltas.append((factual_pred - cf_pred).abs())
+        delta = torch.cat(deltas, dim=-1)  # [B, N]
+        target = F.softmax(delta / 0.5, dim=-1)
+        target = target * node_gate
+        return target / target.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def forward(
+        self,
+        text: torch.Tensor,
+        audio: torch.Tensor,
+        video: torch.Tensor,
+        text_mask: Optional[torch.Tensor] = None,
+        audio_mask: Optional[torch.Tensor] = None,
+        video_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        text_mask = self._text_mask_from_input(text, text_mask)
+        audio_mask = build_sequence_mask(audio, audio_mask)
+        video_mask = build_sequence_mask(video, video_mask)
+
+        ht, ha, hv = self._encode_modalities(text, audio, video, text_mask, audio_mask, video_mask)
+
+        text_ev = self.evidence_t(ht, text_mask, modality_id=0)
+        audio_ev = self.evidence_a(ha, audio_mask, modality_id=1)
+        video_ev = self.evidence_v(hv, video_mask, modality_id=2)
+
+        graph = self.graph_builder(text_ev, audio_ev, video_ev)
+        graph_out = self.graph_reasoner(graph)
+        main_out = self.ordinal_head(graph_out["graph_repr"])
+
+        pooled_t = self._evidence_pool(text_ev)
+        pooled_a = self._evidence_pool(audio_ev)
+        pooled_v = self._evidence_pool(video_ev)
+        logit_t = self.uni_t(pooled_t)
+        logit_a = self.uni_a(pooled_a)
+        logit_v = self.uni_v(pooled_v)
+
+        node_mask = graph_out["node_gate"] > 1e-6
+        if self.cfg.compute_node_cf:
+            node_cf_target = self._node_counterfactual_target(graph_out, main_out["output_logit"]).detach()
+        else:
+            node_cf_target = graph_out["node_importance"].detach()
+
+        output = {
+            **main_out,
+            "interval_width": main_out["predictive_variance"].clamp_min(1e-8).sqrt(),
+            "graph_repr": graph_out["graph_repr"],
+            "node_hidden": graph_out["node_hidden"],
+            "z_consensus": graph_out["z_consensus"],
+            "z_conflict": graph_out["z_conflict"],
+            "z_compensation": graph_out["z_compensation"],
+            "role_node_weight": graph_out["role_node_weight"],
+            "node_importance": graph_out["node_importance"],
+            "node_cf_target": node_cf_target,
+            "node_mask": node_mask,
+            "edge_logits": graph_out["edge_logits"],
+            "edge_role_prob": graph_out["edge_role_prob"],
+            "edge_importance": graph_out["edge_importance"],
+            "edge_cf_target": graph_out["edge_cf_target"].detach(),
+            "edge_mask": graph_out["edge_mask"] > 1e-6,
+            "edge_pseudo_target": graph_out["edge_pseudo_target"],
+            "sim": graph_out["sim"],
+            "polarity_nodes": graph_out["polarity"],
+            "uncertainty_nodes": graph_out["uncertainty"],
+            "modality_ids": graph_out["modality_ids"],
+            "logit_t": logit_t,
+            "logit_a": logit_a,
+            "logit_v": logit_v,
+            **self._prefix_evidence("text", text_ev),
+            **self._prefix_evidence("audio", audio_ev),
+            **self._prefix_evidence("video", video_ev),
+        }
+
+        if labels is not None:
+            output["losses"] = self.loss_fn(output, labels)
+
+        return output
+
+
+# -----------------------------------------------------------------------------
+# Minimal smoke test
+# -----------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    torch.manual_seed(7)
+    cfg = CDEGConfig(
+        use_bert=False,
+        feature_dims=(768, 74, 35),
+        d_model=64,
+        n_layers=1,
+        graph_layers=1,
+        k_max=4,
+        topk_attn=0,
+    )
+    model = CDEG_MSA(cfg)
+
+    B, Lt, La, Lv = 2, 12, 20, 16
+    text = torch.randn(B, Lt, 768)
+    audio = torch.randn(B, La, 74)
+    video = torch.randn(B, Lv, 35)
+    labels = torch.tensor([1.2, -0.7])
+
+    out = model(text, audio, video, labels=labels)
+    print("output_logit:", out["output_logit"].shape)
+    print("graph_repr:", out["graph_repr"].shape)
+    print("node_importance:", out["node_importance"].shape)
+    print("edge_role_prob:", out["edge_role_prob"].shape)
+    print("total_loss:", float(out["losses"]["total_loss"].detach()))
