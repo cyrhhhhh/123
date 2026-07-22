@@ -1,0 +1,129 @@
+{
+  "datasetCommonParams": {
+    "dataset_root_dir": "./dataset",
+    "mosi": {
+      "aligned": {
+        "featurePath": "MOSI/aligned_50.pkl",
+        "feature_dims": [768, 5, 20],
+        "train_samples": 1284,
+        "KeyEval": "Loss"
+      }
+    },
+    "mosei": {
+      "aligned": {
+        "featurePath": "MOSEI/aligned_50.pkl",
+        "feature_dims": [768, 74, 35],
+        "train_samples": 16326,
+        "KeyEval": "Loss"
+      }
+    },
+    "synthetic": {
+      "aligned": {
+        "featurePath": "",
+        "feature_dims": [768, 5, 20],
+        "train_samples": 256,
+        "KeyEval": "Loss"
+      }
+    }
+  },
+  "DMRL": {
+    "commonParams": {
+      "need_data_aligned": true,
+      "early_stop": 10,
+      "max_epochs": 40,
+      "use_bert": true,
+      "use_finetune": true,
+      "update_epochs": 1,
+      "cpu": false
+    },
+    "datasetParams": {
+      "mosi": {
+        "batch_size": 16,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.005,
+        "grad_clip": 0.6,
+        "patience": 5,
+        "transformers": "bert",
+        "pretrained": "bert-base-uncased",
+        "d_model": 128,
+        "n_layers": 2,
+        "dropout": 0.3,
+        "k_slots": 4,
+        "n_heads": 4,
+        "ff_mult": 4,
+        "topk_attn": 0,
+        "use_av_pair": false,
+        "transport_temperature": 0.2,
+        "sinkhorn_iters": 5,
+        "role_temperature": 0.5,
+        "cf_tau": 0.5,
+        "w_main": 1.0,
+        "w_uni": 0.2,
+        "w_role": 0.1,
+        "w_ord": 0.2,
+        "w_sparse": 0.01,
+        "w_transport": 0.02,
+        "w_cf": 0.05,
+        "w_var": 0.005
+      },
+      "mosei": {
+        "batch_size": 32,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.001,
+        "grad_clip": 0.6,
+        "patience": 5,
+        "transformers": "bert",
+        "pretrained": "bert-base-uncased",
+        "d_model": 128,
+        "n_layers": 2,
+        "dropout": 0.2,
+        "k_slots": 4,
+        "n_heads": 4,
+        "ff_mult": 4,
+        "topk_attn": 0,
+        "use_av_pair": false,
+        "transport_temperature": 0.2,
+        "sinkhorn_iters": 5,
+        "role_temperature": 0.5,
+        "cf_tau": 0.5,
+        "w_main": 1.0,
+        "w_uni": 0.2,
+        "w_role": 0.1,
+        "w_ord": 0.2,
+        "w_sparse": 0.01,
+        "w_transport": 0.02,
+        "w_cf": 0.05,
+        "w_var": 0.005
+      },
+      "synthetic": {
+        "batch_size": 16,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.0,
+        "grad_clip": 0.6,
+        "patience": 2,
+        "transformers": "bert",
+        "pretrained": "bert-base-uncased",
+        "d_model": 64,
+        "n_layers": 1,
+        "dropout": 0.1,
+        "k_slots": 3,
+        "n_heads": 4,
+        "ff_mult": 2,
+        "topk_attn": 0,
+        "use_av_pair": false,
+        "transport_temperature": 0.2,
+        "sinkhorn_iters": 3,
+        "role_temperature": 0.5,
+        "cf_tau": 0.5,
+        "w_main": 1.0,
+        "w_uni": 0.2,
+        "w_role": 0.1,
+        "w_ord": 0.2,
+        "w_sparse": 0.01,
+        "w_transport": 0.02,
+        "w_cf": 0.05,
+        "w_var": 0.005
+      }
+    }
+  }
+}
