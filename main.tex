@@ -1,0 +1,606 @@
+% Evidence-grounded rewrite, 27 September 2026.
+% Compile with pdfLaTeX + BibTeX, or tectonic main.tex.
+\documentclass[review,12pt]{elsarticle}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx,booktabs,tabularx,array}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\journal{Pattern Recognition}
+\biboptions{numbers,sort&compress}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\pool}{\operatorname{Pool}}
+\newcommand{\MHA}{\operatorname{MHA}}
+\newcommand{\LN}{\operatorname{LN}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\MAE}{\operatorname{MAE}}
+\newcommand{\E}{\mathbb{E}}
+\newtheorem{proposition}{Proposition}
+\emergencystretch=2em
+\allowdisplaybreaks
+\begin{document}
+\begin{frontmatter}
+\title{From Shared Representations to Predictive Roles: Consensus-Guided Residual Routing for Multimodal Sentiment Analysis}
+\author{Author information pending}
+\address{Affiliations and corresponding author to be supplied}
+\begin{abstract}
+Acoustic and visual cues can reinforce an expressed opinion or provide evidence for revising it. Separating shared and private features does not determine which of these predictive roles a modality-specific cue should play. We propose Consensus--Residual Effect-guided Disentanglement (CRED), a serial framework that routes residual multimodal information relative to a learned consensus. A shared/private backbone first encodes representational origin. Agreement-weighted donor attention then constructs a target-conditioned consensus, and a hybrid gate partitions the remaining residual into candidate supportive and conflicting components at token and feature level. Language-anchored queries retrieve nonverbal conflict evidence, while two separately scaled corrections update a consensus prediction. The additive output exposes the signed contribution of each correction, and auxiliary objectives connect routing to detached probe disagreement and support scaling to its prediction effect. We characterize residual conservation and distinguish numerical correction effects from semantic or causal explanations. The resulting formulation links multimodal feature decomposition to the question of how new evidence should reinforce or revise an existing sentiment estimate.
+\end{abstract}
+\begin{keyword}
+multimodal sentiment analysis \sep residual routing \sep cross-modal conflict
+\sep representation disentanglement \sep language-guided attention \sep additive prediction
+\end{keyword}
+\end{frontmatter}
+
+\section{Introduction}
+Multimodal sentiment analysis estimates the polarity and intensity of an opinion from language, acoustic observations, and visual behavior. The value of combining these streams lies partly in their differences. A vocal emphasis may strengthen a positive statement, hesitation may weaken it, and a facial response may challenge its literal interpretation. CMU-MOSI and CMU-MOSEI provide widely used settings for studying this interaction at the utterance level \cite{mosi,mosei}. A useful recognizer must therefore do more than aggregate informative features: it must determine how information from one stream should modify the estimate supported by the others.
+
+Cross-modal attention enables flexible information exchange \cite{mult}. Learning shared and private representations separates common content from modality-specific content \cite{misa}. These operations address related but distinct questions. Attention determines where to retrieve information, while shared and private decomposition concerns its representational origin. Neither operation alone specifies the predictive role of a retrieved private cue. A feature can be specific to the acoustic stream while agreeing with the current estimate; another acoustic feature can oppose it. Suppressing both as discrepancies loses useful information, whereas treating both as generic complementary features hides the reason for a prediction change.
+
+This distinction is especially relevant to transcript-dominant sentiment recognition. Language often provides a strong reference, but the reference can be incomplete or misleading. Language-guided models use this asymmetry to organize fusion \cite{tetfn,almt}. Conflict-aware methods further model disagreement through specialized representations, interactions, or prediction paths \cite{mcan,eca}. The remaining design question considered here is narrower: can a model retain a consensus estimate, route deviations according to their candidate roles, and expose the separate effects of those deviations on its final prediction?
+
+We approach this question with two serial decompositions. The first maps each modality into shared and private representations. The second, Consensus--Residual Effect-guided Disentanglement (CRED), constructs a target-conditioned consensus from the shared representations and forms a residual from private features and deviation from that consensus. A gate combines learned feature-dependent routing with donor agreement. It partitions the residual into complementary candidate support and conflict components, allowing both to remain active within the same utterance.
+
+The partition becomes operational through an additive prediction interface. A consensus head supplies the reference estimate. A support head reads pooled supportive evidence, while language-anchored attention retrieves acoustic and visual conflict evidence for a separate correction. The final output is
+\begin{equation}
+\hat y=b+\Delta_s+\Delta_c,
+\label{eq:additive}
+\end{equation}
+where $b$ denotes the consensus prediction, and $\Delta_s$ and $\Delta_c$ are separately scaled signed corrections. This construction makes a branch's numerical contribution directly accessible. It also permits a precise question for each utterance: did adding the correction reduce or increase the prediction error?
+
+The terms \emph{support} and \emph{conflict} identify the intended roles of learned routes. They are not labels supplied by human annotators. A routed conflict feature need not encode sarcasm or an explicitly contradictory facial expression, and a support correction need not always increase sentiment magnitude. We therefore distinguish architectural properties, which follow from the implementation, from semantic interpretations and comparative benefits, which require empirical evidence.
+
+The contributions are as follows:
+\begin{enumerate}
+\item We formulate a serial connection between representational origin and predictive role. Shared/private encoding is followed by consensus-relative routing, so modality specificity is not equated with disagreement.
+\item We develop agreement-weighted consensus construction and complementary residual routing at token and feature level. The routing preserves the learned residual while retaining both candidate roles.
+\item We couple language-anchored retrieval of nonverbal conflict with separately scaled additive corrections. Effect-based auxiliary supervision and an explicit correction interface make the intended roles measurable without treating attention or routing weights as semantic ground truth.
+\end{enumerate}
+
+We evaluate CRED on CMU-MOSI and CMU-MOSEI and compare its performance with published results from representative fusion, disentanglement, and conflict-aware models. The experiments examine both continuous sentiment estimation and discrete sentiment prediction.
+
+\section{Related work}
+\subsection{Multimodal fusion and language-guided interaction}
+Early MSA fusion models sought to represent cross-modal interactions explicitly. Tensor Fusion Networks (TFN) augment unimodal features with modality-presence terms and use their outer product to encode intra- and inter-modal interactions \cite{tfn}. Low-rank Multimodal Fusion (LMF) factorizes the fusion tensor to reduce the cost of this interaction model \cite{lmf}. The Memory Fusion Network (MFN) instead models view-specific dynamics and cross-view interactions over time through memory-based attention and a gated memory \cite{mfn}. MulT subsequently uses directional pairwise cross-modal attention to learn interactions between potentially unaligned sequences \cite{mult}. Together, these methods trace a shift from explicit feature interaction toward temporally structured and attention-based exchange. They establish the value of cross-modal complementarity, but their prediction heads do not in general expose separate, signed changes to a retained consensus estimate.
+
+Language-guided methods exploit the strong linguistic signal as a useful reference. TETFN enriches nonlinguistic representations through text-oriented attention \cite{tetfn}, while ALMT learns a language-guided adaptive hyper-modality representation \cite{almt}. Such designs motivate the language anchor used in CRED, but the role assigned here is narrower: language and shared evidence form a reference for retrieving already-routed acoustic and visual conflict. The current implementation assumes aligned benchmark inputs; it does not establish that language should dominate other modalities in every task or when transcripts are unreliable.
+
+\subsection{Shared/private representations and feature decomposition}
+Representation learning has progressively distinguished cross-modal commonality from modality-specific information. MISA separates modality-invariant and modality-specific representations \cite{misa}; Self-MM introduces self-supervised multimodal and unimodal tasks for learning modality-specific representations \cite{selfmm}; and FDR-MSA couples feature disentanglement with reconstruction objectives \cite{fdrmsa}. ConFEDE learns text-centered similar and dissimilar features through contrastive decomposition \cite{confede}, while DLF combines shared/private representations with a Language-Focused Attractor and hierarchical prediction paths \cite{dlf}. The first stage of our model is adapted from DLF: its original attractor and prediction paths are replaced by consensus construction, residual routing, and the additive prediction head.
+
+The number of partitions is not itself a distinction of this work. TriDiRA separates invariant, effective modality-specific, and ineffective modality-specific representations \cite{tridira}, whereas TSD distinguishes globally common, pairwise shared, and private subspaces \cite{tsd}. These methods partition features according to invariance, task utility, or sharing structure, rather than by the role a residual plays relative to a prediction reference.
+
+\subsection{Explicit conflict modeling and adaptive prediction}
+Recent work has moved beyond treating cross-modal disagreement only as nuisance variation. MCAN separates aligned and conflicting constituents at multiple interaction levels \cite{mcan}, while TriagedMSA identifies utterance-level agreement and disagreement and uses distinct attention mechanisms for the two cases \cite{triagedmsa}. ECA estimates conflict intensity from unimodal predictions, processes each sample through both easy and hard paths, and uses the estimate to combine their predictions; its hard path also models similar and dissimilar evidence with decoupled attention \cite{eca}. Thus, neither conflict-dependent prediction adaptation nor similarity/dissimilarity attention is unique to CRED.
+
+Other recent approaches use disagreement to control representation learning or fusion. CACR weights cross-modal reconstruction according to conflict estimates and refines language with nonverbal cues \cite{cacr}. RSCAN uses text-guided conflict quantification to adapt the contributions of the other modalities after task-oriented feature refinement \cite{rscan}. HCF-Net explicitly separates an alignment context from disagreement-preserving residual signals and combines the two branches with supervised gating \cite{hcfnet}. DCAF derives instance-dependent unimodal supervision from global labels to modulate affective consistency and shared/specific separation \cite{dcaf}. These are close precedents: in particular, HCF-Net already makes an alignment-versus-residual distinction, while RSCAN and ECA already adapt prediction-relevant multimodal contributions to conflict.
+
+The distinction investigated here is more specific than retaining a conflict feature or adapting a fusion weight. CRED forms a target-conditioned consensus, constructs a residual from private information and deviation from that consensus, and complementarily routes the residual into candidate support and conflict components at token and feature level. It then retains a consensus prediction and adds separately scaled support and conflict corrections, rather than mixing two complete easy/hard predictions or gating an alignment and conflict representation into one fused vector. This is an architectural distinction to be tested, not a priority or performance claim. The labels support and conflict denote computational roles, not ground-truth semantic classes; their predictive value requires matched comparisons and correction-effect analyses.
+
+\section{Method}
+\subsection{Task and architecture}
+For an utterance, let $X_m\in\R^{T\times d_m}$ denote the aligned observations from modality $m\in\mathcal M=\{l,a,v\}$, corresponding to language, audio, and vision. A shared binary mask identifies valid aligned positions. The target is a continuous sentiment score $y\in[-3,3]$. The current serial implementation assumes aligned sequence inputs, requires at least one valid position in each modality, and does not support independently missing modalities through separate masks.
+
+Figure~\ref{fig:architecture} summarizes the model. Shared and private encoders operate in parallel within Stage I. Their outputs then enter Stage II in series. After donor-conditioned consensus construction, Stage II applies Consensus-Relative Residual Routing (CRR) to allocate residual information to complementary candidate support and conflict routes. Language-Anchored Conflict Retrieval (LACR) then uses the conflict route to retrieve nonverbal evidence for prediction correction. Separately scaled support and conflict corrections update the consensus estimate through the final additive prediction. No original DLF prediction is added in parallel to Equation~\eqref{eq:additive}.
+
+\begin{figure}[!p]
+\centering
+\includegraphics[width=\linewidth]{model_architecture_eca_style_v4.png}
+\caption{Architecture of CRED. Top: shared/private encoding, donor-conditioned consensus and residual routing, and additive prediction. Projection denotes the temporal convolution; Layer Norm denotes the modality-specific normalizations producing $C_m^0$ and $S_m^0$. The Consensus Head, Support Head, and Conflict Head denote $h_b$, $h_s$, and $h_c$, respectively. Colored dashed arrows link the overview to the enlarged modules. (b) Consensus-Relative Residual Routing (CRR): residual construction and parallel learned/agreement gates; their mean allocates the same $R_m$ to complementary routes $P_m$ and $Q_m$. (c) Language-Anchored Conflict Retrieval (LACR): retrieval from $Q_a,Q_v$ followed by a query residual and normalization; a prediction head and scale produce the conflict correction. Linguistic conflict enters $\bar Q$ but not the retrieval memory. Some head and scale conditioning connections are omitted for readability; their full inputs are specified in Equations~\eqref{eq:base_support}, \eqref{eq:raw_conflict}, and \eqref{eq:scales}. Padding masks and auxiliary training losses are omitted.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Mask-aware shared/private encoding}
+Temporal convolutions project the input features into a common hidden dimension $d$:
+\begin{equation}
+Z_m=\operatorname{Conv1D}_m(X_m),\qquad
+C_m=E^{\rm sh}(Z_m),\quad S_m=E_m^{\rm pr}(Z_m).
+\label{eq:stage1}
+\end{equation}
+The shared Transformer $E^{\rm sh}$ reuses its parameters across modalities, whereas each private Transformer $E_m^{\rm pr}$ has its own parameters. The terms shared and private describe parameterization and training objectives; parameter sharing does not by itself prove modality invariance.
+
+Invalid input positions are zeroed before convolution. For a kernel of width $k_m$, the output length is $T-k_m+1$. A convolutional output is treated as valid if at least one input in its window is valid. The projected mask is propagated through the encoders, attention, pooling, and relevant auxiliary losses, excluding padded positions from observed-token computations. The first-stage Transformers use a triangular self-attention mask that blocks future positions. This mask is not applied to donor attention, whose keys are masked only at padded positions; the subsequent donor and conflict-retrieval stages can therefore access all valid positions in the utterance. Accordingly, CRED is an utterance-level offline predictor, not an end-to-end causal or streaming model. The first-stage mask is a stage-specific encoding choice and does not establish temporal causality for the complete network.
+
+A pointwise reconstruction head predicts $Z_m$ from $[S_m;C_m]$, and a squared-cosine penalty discourages collinearity of the two feature families. A shared-feature probe produces a unimodal score $z_m$ for auxiliary training supervision and weak routing targets. The final sentiment output does not use its score. The supplied forward path still computes the probes at inference, so their computational cost remains unless a separately verified prediction-only path is implemented.
+
+\subsection{Donor-conditioned consensus}
+Each target modality receives information from the other two modalities. First, modality-specific normalizations give $C_m^0=\LN_m^C(C_m)$ and $S_m^0=\LN_m^S(S_m)$. A donor-attention module, shared across ordered modality pairs, retrieves
+\begin{equation}
+A_{m\leftarrow n}=\MHA_{\rm donor}(C_m^0,C_n^0,C_n^0),\qquad n\ne m.
+\label{eq:donor}
+\end{equation}
+The output is expressed at the target's positions, so donor agreement can be computed token by token:
+\begin{equation}
+q_{mn,t}=\cos(C_{m,t}^0,A_{m\leftarrow n,t}),\qquad
+\alpha_{mn,t}=\frac{\exp(q_{mn,t}/\tau)}{\sum_{j\ne m}\exp(q_{mj,t}/\tau)}.
+\label{eq:agreement}
+\end{equation}
+The consensus is the normalized donor update of the target shared representation:
+\begin{equation}
+B_m=\LN_m^B\left(C_m^0+\sum_{n\ne m}\alpha_{mn}\odot A_{m\leftarrow n}\right).
+\label{eq:consensus}
+\end{equation}
+Here and below, scalar token weights are broadcast over feature dimensions. Donor weighting favors greater compatibility within the learned feature space. It does not compare semantic sentiment labels, and $B_m$ is a target-conditioned representation rather than an estimate of an objectively agreed emotion.
+
+\subsection{Consensus-relative residual routing (CRR)}
+The residual combines modality-private information with the shared feature's deviation from its consensus update:
+\begin{equation}
+R_m=\phi_m([S_m^0;C_m^0-B_m]),
+\label{eq:residual}
+\end{equation}
+where $\phi_m$ is a two-layer projection. The difference $C_m^0-B_m$ is a learned feature difference; it is not the residual of an orthogonal projection. The construction retains private content that would be lost if only cross-modal commonality were propagated.
+
+A learned gate reads both the residual and the consensus. An agreement gate summarizes the compatibility of the attended donors:
+\begin{align}
+G_m^{\rm learn}&=\sigma\left(\psi_m([R_m;B_m])/\tau\right),\\
+g_{m,t}^{\rm agr}&=\frac{1+\clip\left(\sum_{n\ne m}\alpha_{mn,t}q_{mn,t},-1,1\right)}{2},\\
+G_m&=\tfrac12\left(G_m^{\rm learn}+g_m^{\rm agr}\right).
+\label{eq:gate}
+\end{align}
+The hybrid rule supplies a feature-dependent learned allocation while retaining an explicit relationship to donor agreement. The candidate support and conflict tensors are
+\begin{equation}
+P_m=G_m\odot R_m,\qquad Q_m=(1-G_m)\odot R_m.
+\label{eq:partition}
+\end{equation}
+Both routes can be active at a given token, and their allocations can vary across channels. The terms support and conflict name downstream computational roles, not ground-truth semantic classes; no token-level support/conflict annotations supervise this split. The routes are complementary, not independent feature generators, and their corresponding coordinates inherit the same sign from $R_m$. Outputs at padded target positions are zeroed.
+
+\subsection{Pooling and the consensus estimate}
+For an evidence family $H\in\{B,P,Q\}$, a learned scorer pools valid tokens within each modality:
+\begin{equation}
+\beta^H_{m,t}=\operatorname{softmax}_{t\in\mathcal V_m}
+\left((w_2^H)^\top\operatorname{Dropout}_{p_{\rm pool}}
+\left(\tanh(W_1^H H_{m,t})\right)\right),\qquad
+\bar H=\frac13\sum_{m\in\mathcal M}\sum_{t\in\mathcal V_m}\beta^H_{m,t}H_{m,t}.
+\label{eq:pool}
+\end{equation}
+Each evidence family has a separate scorer, shared across modalities within that family. Dropout is applied between the two linear layers during training and disabled at evaluation; the checked-in configuration sets $p_{\rm pool}=0.3$. Each modality must contain at least one valid token for its temporal softmax to be defined, so fully padded modalities are outside the supported input setting. Equal averaging balances the aggregation coefficients of the modality summaries. It does not normalize away differences in feature magnitude.
+
+Let $b_l=\pool_l(B_l)$ denote the language-only consensus summary. The consensus prediction and the raw support correction are
+\begin{equation}
+b=h_b([\bar B;b_l]),\qquad d_s=h_s([\bar B;\bar P]).
+\label{eq:base_support}
+\end{equation}
+The reference estimate therefore combines a global summary with explicit linguistic consensus. It remains a learned multimodal prediction and is not equivalent to a text-only baseline.
+
+\subsection{Language-anchored conflict retrieval (LACR)}
+The conflict branch uses a language summary and global consensus to anchor its queries. The same language-pooling scorer used for $b_l$ pools the sum of language consensus and support:
+\begin{align}
+\ell&=\pool_l(B_l+P_l),& a&=\LN_{\rm no\ affine}(\ell+\bar B),\nonumber\\
+q_+&=u_++a,& q_-&=u_--a.
+\label{eq:anchor}
+\end{align}
+The two learned query vectors $u_+$ and $u_-$ are offset in opposite directions by the anchor. Both query the concatenated acoustic and visual conflict tokens:
+\begin{align}
+K&=[Q_a;Q_v]_{\rm tokens},& U&=[q_+;q_-]_{\rm tokens},\nonumber\\
+[r_+;r_-]&=\MHA_{\rm ev}(U,K,K),\nonumber\\
+[e_+;e_-]&=\LN\bigl([r_+;r_-]+U\bigr).
+\label{eq:conflict_attention}
+\end{align}
+Here, $r_+$ and $r_-$ are the attention outputs before the query residual and layer normalization, corresponding to the inputs of the Residual + LN block in Figure~\ref{fig:architecture}(c). Padding is masked in the key sequence. Linguistic conflict tokens are excluded from these keys and values, but they still enter $\bar Q$ and hence the conflict scale. This asymmetry lets language guide retrieval while retaining pooled information from all three conflict routes.
+
+The raw conflict correction is
+\begin{equation}
+d_c=h_c([\bar B;\ell;e_+;e_-]).
+\label{eq:raw_conflict}
+\end{equation}
+The positive and negative offsets distinguish the queries structurally. They do not force the retrieved summaries to encode positive and negative sentiment, nor do they guarantee that one summary supports and the other contradicts the label.
+
+Separate scalar gates attenuate the raw corrections:
+\begin{align}
+s_s&=\sigma(g_s([\bar B;\bar P])),&\Delta_s&=s_s d_s,\\
+s_c&=\sigma(g_c([\bar B;\bar Q])),&\Delta_c&=s_c d_c.
+\label{eq:scales}
+\end{align}
+The raw heads are real-valued and unconstrained. Thus, a sigmoid scale bounds a correction relative to its own raw value but does not impose a fixed absolute bound. Combining Equation~\eqref{eq:scales} with Equation~\eqref{eq:additive} gives the inference output.
+
+\subsection{Training objectives}
+We write $\sg(x)$ for a stop-gradient operation: it has value $x$ in the forward pass and contributes no gradient through $x$ in the indicated loss.
+The main prediction and the consensus estimate receive absolute-error supervision:
+\begin{align}
+\mathcal L_{\rm main}&=\E|\hat y-y|,&
+\mathcal L_b&=\E|b-y|,\nonumber\\
+\mathcal L_{\rm probe}&=\sum_m\E|z_m-y|.
+\end{align}
+Direct consensus supervision discourages the reference head from relying entirely on downstream corrections. Probe supervision supplies sentiment-related shared representations, while probe predictions used to construct routing targets are detached.
+
+First-stage regularization combines masked reconstruction with separation of shared and private features:
+\begin{align}
+\mathcal L_{\rm rec}&=\sum_m\operatorname{MSE}_{\rm valid}(D_m([S_m;C_m]),Z_m),\\
+\mathcal L_{\rm orth}&=\sum_m\E_{\rm valid}\bigl[\cos^2(S_m,C_m)\bigr].
+\end{align}
+For the second stage, a cross-covariance penalty discourages second-order association between every pair in $\{B_m,P_m,Q_m\}$:
+\begin{align}
+\mathcal L_{\rm dec}&=\sum_m\sum_{(H,J)\in\mathcal P_m}
+\frac{\|\operatorname{Cov}_{\rm valid}(H,J)\|_F^2}{d^2},\\
+\mathcal P_m&=\{(B_m,P_m),(B_m,Q_m),(P_m,Q_m)\}.
+\end{align}
+Valid tokens are centered across the minibatch when computing covariance. This regularizer does not establish statistical independence or a unique semantic decomposition.
+
+\paragraph{Weak routing supervision.}
+Let $\bar z=\frac13\sum_m z_m$. A detached disagreement score combines magnitude and sign disagreement:
+\begin{equation}
+r_m=\sg\left(|z_m-\bar z|+\mathbb I[\operatorname{sign}(z_m)\ne\operatorname{sign}(\bar z)]\right),\qquad
+t_m=\frac{r_m}{1+r_m}.
+\label{eq:weak_target}
+\end{equation}
+The mean allocation to conflict is trained toward $t_m$. A minimum temporal-variance term discourages uniform token routing when the target indicates disagreement. The resulting loss is denoted $\mathcal L_{\rm route}$. Its target is a model-derived proxy, not an independently annotated conflict label. The detailed reduction is provided in Appendix~\ref{app:objectives}.
+
+\paragraph{Support supervision by prediction effect.}
+The support branch receives a low-conflict-weighted absolute-error loss on $\sg(b)+\Delta_s$. The support scale also learns a detached target derived from the one-dimensional correction problem. For $|d_s|\ge 10^{-4}$,
+\begin{equation}
+s_s^*=\sg\left[\clip\left(\frac{y-b}{d_s},0,1\right)\right].
+\label{eq:optimal_scale}
+\end{equation}
+A Smooth-L1 loss trains $s_s$ toward this value. Samples with negligible raw corrections are masked from this gate loss. Equation~\eqref{eq:optimal_scale} connects scale supervision to the correction's actual direction and magnitude; it does not supply additional labels at inference.
+
+\paragraph{Directional regularization.}
+The supplied configuration also penalizes a support correction that opposes a non-neutral consensus and a conflict correction that reinforces it. Let $\mathcal I=\{i:|b_i|>0.1\}$ index eligible samples, with $\bar t_i=\frac13\sum_m t_{m,i}$ and $d_i=\operatorname{sign}(\sg(b_i))$. When $\mathcal I$ is nonempty, the implemented loss is
+\begin{equation}
+\mathcal L_{\rm effect}=\frac{1}{|\mathcal I|}\sum_{i\in\mathcal I}
+\left[\operatorname{ReLU}(-d_i\Delta_{s,i})
++\bar t_i\operatorname{ReLU}(d_i\Delta_{c,i})\right].
+\label{eq:effect_loss}
+\end{equation}
+It is zero when $\mathcal I$ is empty. The conflict term is weighted by mean weak conflict intensity, and both terms are soft preferences rather than hard constraints. This loss can conflict with Equation~\eqref{eq:optimal_scale}: an overconfident positive estimate may benefit from a negative support correction even though that correction reduces its magnitude. The directional term is therefore an empirical regularizer, not a guarantee that the support route always reinforces the consensus or reduces error; its contribution is tested by the planned loss ablation in Table~\ref{tab:modal_loss}.
+
+The nonzero weights in the inspected configuration yield
+\begin{align}
+\mathcal L={}&\mathcal L_{\rm main}+0.05\mathcal L_{\rm probe}
++0.20\mathcal L_b+0.05\mathcal L_{\rm rec}\nonumber\\
+&+0.01\mathcal L_{\rm orth}+0.01\mathcal L_{\rm dec}
++0.10\mathcal L_{\rm route}\nonumber\\
+&+0.01\mathcal L_{\rm effect}+0.05\mathcal L_{\rm support}
++0.05\mathcal L_{\rm scale}.
+\label{eq:total_loss}
+\end{align}
+Other implemented objectives, including specific-cycle, shared-alignment, second-stage reconstruction, conflict-ranking, and low-conflict delta penalties, have zero weights in that configuration. They are not active components of Equation~\eqref{eq:total_loss}.
+
+\subsection{Structural properties and their limits}
+The following properties characterize the mechanism independently of benchmark performance. They are direct consequences of the construction, not evidence of predictive superiority.
+
+\begin{proposition}[Complementary residual conservation]
+At every valid token and feature coordinate, $P_m+Q_m=R_m$. Moreover, $|P_m|+|Q_m|=|R_m|$ coordinatewise.
+\end{proposition}
+\begin{proof}
+Equation~\eqref{eq:partition} uses the same residual with coefficients $G_m$ and $1-G_m$. Both coefficients are nonnegative and sum to one, proving both identities.
+\end{proof}
+Conservation prevents routing itself from discarding part of the constructed residual. It does not imply that $B_m+R_m$ reconstructs the raw input, or that subsequent attention and pooling retain all residual information.
+
+\begin{proposition}[Optimal bounded scale for a fixed correction]
+For fixed $b$, $d\ne0$, and target $y$, a minimizer of $|y-(b+sd)|$ over $s\in[0,1]$ is $s^*=\clip((y-b)/d,0,1)$.
+\end{proposition}
+\begin{proof}
+The objective equals $|d|\,|s-(y-b)/d|$. Its constrained minimizer is the projection of $(y-b)/d$ onto $[0,1]$.
+\end{proof}
+This property justifies the detached support-scale target for fixed current predictions. Joint optimization changes both $b$ and $d_s$, so the property is local to target construction. It does not guarantee that the trained model attains a globally optimal correction. A sigmoid also approaches the interval endpoints only in the limit.
+
+The hybrid gate has a further restriction. Holding agreement $g^{\rm agr}$ fixed, the learned route lies between $g^{\rm agr}/2$ and $(1+g^{\rm agr})/2$. Thus, learned routing cannot fully override the agreement prior. Likewise, two-donor weighting with bounded cosine scores gives
+\begin{equation}
+\alpha_{mn,t}\le\frac{1}{1+\exp(-2/\tau)}.
+\end{equation}
+At the configured $\tau=1.5$, this bound is approximately 0.7914. The donor rule is a soft preference, not hard donor selection. These restrictions motivate comparisons against learned-only routing and sensitivity to temperature.
+
+Finally, Equation~\eqref{eq:additive} is an accounting identity. Reporting $\Delta_s$ or $\Delta_c$ explains how a particular forward pass changes numerically, but does not identify a causal contribution of a raw modality. Shared representations and joint training couple the branches, and the additive decomposition alone does not identify unique semantic roles.
+
+\section{Experiments}
+\subsection{Datasets and evaluation metrics}
+We evaluate CRED on CMU-MOSI \cite{mosi} and CMU-MOSEI \cite{mosei}, two widely used benchmarks for multimodal sentiment analysis.
+
+\paragraph{CMU-MOSI.}
+CMU-MOSI contains 2,199 opinion video segments. Its standard partition comprises 1,284 training, 229 validation, and 686 test samples. Each segment contains language, acoustic, and visual observations and is annotated with a sentiment score ranging from $-3$ to $3$.
+
+\paragraph{CMU-MOSEI.}
+CMU-MOSEI provides a larger collection of opinion video segments covering diverse speakers and topics. The benchmark partition reported in DLF \cite{dlf} contains 16,326 training, 1,871 validation, and 4,659 test samples. Sentiment annotations use the same $[-3,3]$ scale as CMU-MOSI.
+
+\paragraph{Evaluation metrics.}
+Following DLF \cite{dlf}, we report seven-class accuracy (Acc-7), five-class accuracy (Acc-5), binary accuracy (Acc-2), weighted F1, Pearson correlation (Corr), and mean absolute error (MAE). Higher values indicate better performance for all metrics except MAE. For our results, Acc-7 and Acc-5 are obtained by clipping the regression outputs to $[-3,3]$ and $[-2,2]$, respectively, and rounding them to the nearest integer. Acc-2 and F1 exclude samples with neutral ground-truth labels and distinguish positive from negative sentiment. Accuracies and F1 are expressed as percentages.
+
+\subsection{Implementation details}
+CRED uses DeBERTa-based language representations \cite{deberta} together with acoustic and visual inputs. The architecture processes aligned sequences and projects the three modalities into a common hidden space. Table~\ref{tab:config} lists the settings in the current implementation. The two correction scales are initialized to 0.5, and the routing temperature is set to 1.5.
+
+\begin{table}[t]
+\centering
+\caption{Settings in the current CRED implementation. Training settings remain to be checked against the DeBERTa experiment configuration.}
+\label{tab:config}
+\small
+\begin{tabular}{lcc}
+\toprule
+Setting & MOSI & MOSEI\\
+\midrule
+Hidden dimension & 50 & 50\\
+Attention heads / Transformer layers & 10 / 2 & 10 / 2\\
+Temporal convolution kernel & 5 & 3\\
+Batch size & 16 & 32\\
+Non-language learning rate & $10^{-4}$ & $10^{-4}$\\
+Language learning rate & $2\times10^{-5}$ & $2\times10^{-5}$\\
+Weight decay & 0.005 & 0.001\\
+Gradient accumulation steps & 10 & 5\\
+Routing temperature & 1.5 & 1.5\\
+Minimum routing variance & 0.01 & 0.01\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\emph{[Author check before submission: confirm the DeBERTa checkpoint and training mode, acoustic/visual feature extractors, data split and alignment, optimizer settings, hardware, seed, and checkpoint-selection rule. The current results are from one run per dataset.]}
+
+\subsection{Main results}
+\paragraph{Baselines.}
+We compare CRED with representative fusion, disentanglement, and conflict-aware methods. TFN \cite{tfn}, LMF \cite{lmf}, and MulT \cite{mult} represent tensor fusion, low-rank fusion, and directional cross-modal attention. DLF \cite{dlf}, FDR-MSA \cite{fdrmsa}, and TSD \cite{tsd} learn decomposed multimodal representations, while RSCAN \cite{rscan}, DCAF \cite{dcaf}, and HCF-Net \cite{hcfnet} address cross-modal disagreement through adaptive representation learning or fusion.
+
+Tables~\ref{tab:literature} and \ref{tab:results} report Acc-7, Acc-5, Acc-2, F1, Corr, and MAE. Baseline scores are quoted from the sources specified in the captions. FDR-MSA, RSCAN, and DCAF use their binary scores excluding neutral labels. TFN, LMF, and MulT retain the values compiled in DLF and their original evaluation conventions. TSD uses aligned inputs; its binary scores are omitted pending verification of the neutral-label convention. HCF-Net contributes regression metrics only because its classification scores use separate task heads and a different binary convention. Each method retains its published feature and training configuration.
+
+\begin{table}[t]
+\centering
+\caption{Performance comparison on CMU-MOSI. Accuracies and F1 are percentages. $\dagger$: values quoted from DLF Table~1 \cite{dlf}; other baseline scores come from their own papers. Dashes indicate unreported or excluded metrics. Bold denotes the best listed value under the respective reported settings. CRED results are from a single run.}
+\label{tab:literature}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Acc-7 ($\uparrow$) & Acc-5 ($\uparrow$) & Acc-2 ($\uparrow$) & F1 ($\uparrow$) & Corr ($\uparrow$) & MAE ($\downarrow$)\\
+\midrule
+TFN$^\dagger$ \cite{tfn} & 34.90 & 39.39 & 80.08 & 80.07 & 0.698 & 0.901\\
+LMF$^\dagger$ \cite{lmf} & 33.20 & 38.13 & 82.50 & 82.40 & 0.695 & 0.917\\
+MulT$^\dagger$ \cite{mult} & 40.00 & 42.68 & 83.00 & 82.00 & 0.698 & 0.871\\
+DLF \cite{dlf} & 47.08 & 52.33 & 85.06 & 85.04 & 0.781 & 0.731\\
+FDR-MSA \cite{fdrmsa} & 46.84 & -- & 86.28 & 86.31 & 0.796 & 0.703\\
+RSCAN \cite{rscan} & 47.57 & 54.23 & 86.54 & 86.39 & 0.794 & 0.7071\\
+DCAF \cite{dcaf} & 47.23 & 52.19 & 86.89 & 86.87 & 0.795 & 0.713\\
+TSD (aligned) \cite{tsd} & \textbf{48.80} & -- & -- & -- & -- & 0.701\\
+HCF-Net \cite{hcfnet} & -- & -- & -- & -- & 0.823 & \textbf{0.627}\\
+\midrule
+CRED (ours) & 48.25 & \textbf{55.83} & \textbf{87.35} & \textbf{87.36} & \textbf{0.8390} & 0.6478\\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Performance comparison on CMU-MOSEI. Accuracies and F1 are percentages. $\dagger$: values quoted from DLF Table~1 \cite{dlf}; other baseline scores come from their own papers. Dashes indicate unreported or excluded metrics. Bold denotes the best listed value under the respective reported settings. CRED results are from a single run.}
+\label{tab:results}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Acc-7 ($\uparrow$) & Acc-5 ($\uparrow$) & Acc-2 ($\uparrow$) & F1 ($\uparrow$) & Corr ($\uparrow$) & MAE ($\downarrow$)\\
+\midrule
+TFN$^\dagger$ \cite{tfn} & 50.20 & 53.10 & 82.50 & 82.10 & 0.700 & 0.593\\
+LMF$^\dagger$ \cite{lmf} & 48.00 & 52.90 & 82.00 & 82.10 & 0.677 & 0.623\\
+MulT$^\dagger$ \cite{mult} & 51.80 & 54.18 & 82.50 & 82.30 & 0.703 & 0.580\\
+DLF \cite{dlf} & 53.90 & 55.70 & 85.42 & 85.27 & 0.764 & 0.536\\
+FDR-MSA \cite{fdrmsa} & \textbf{56.70} & -- & 86.32 & 85.60 & 0.791 & 0.521\\
+RSCAN \cite{rscan} & 53.14 & 55.40 & 85.88 & 85.85 & 0.7761 & 0.5322\\
+DCAF \cite{dcaf} & 55.33 & -- & 86.74 & 86.62 & 0.771 & 0.528\\
+TSD (aligned) \cite{tsd} & 54.90 & -- & -- & -- & -- & 0.529\\
+HCF-Net \cite{hcfnet} & -- & -- & -- & -- & \textbf{0.814} & 0.589\\
+\midrule
+CRED (ours) & 55.81 & \textbf{57.69} & \textbf{87.40} & \textbf{87.42} & 0.7995 & \textbf{0.5036}\\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\paragraph{Performance on CMU-MOSI.}
+CRED achieves an Acc-7 of 48.25\%, an Acc-5 of 55.83\%, an Acc-2 of 87.35\%, an F1 of 87.36\%, a Corr of 0.8390, and an MAE of 0.6478. Compared with the published DLF scores, the four classification metrics improve by 1.17, 3.50, 2.29, and 2.32 percentage points, respectively; Corr increases by 0.0580 and MAE decreases by 0.0832. CRED also exceeds the listed RSCAN and DCAF scores across their six reported metrics. The highest listed Corr and strong binary scores indicate competitive sentiment estimation, although aligned TSD has a higher Acc-7 and HCF-Net has a lower MAE.
+
+\paragraph{Performance on CMU-MOSEI.}
+CRED obtains an Acc-7 of 55.81\%, an Acc-5 of 57.69\%, an Acc-2 of 87.40\%, an F1 of 87.42\%, a Corr of 0.7995, and an MAE of 0.5036. Relative to DLF, the four classification metrics improve by 1.91, 1.99, 1.98, and 2.15 percentage points. CRED attains the lowest listed MAE, reducing it by 0.0324 relative to DLF and by 0.0174 relative to FDR-MSA. Its binary scores also exceed the listed RSCAN and DCAF values. The remaining differences are metric-dependent: FDR-MSA attains a higher Acc-7, while HCF-Net reports a higher Corr. These results position CRED as competitive across classification and regression without implying uniform superiority on every measure.
+
+\subsection{Ablation study}
+\noindent\emph{[Draft status: full-model scores are available; entries marked pending require new experiments. No ablation outcome is asserted below.]}
+
+\paragraph{Architectural components.}
+Table~\ref{tab:ablation} specifies the component comparisons. The shared/private baseline replaces the complete consensus and correction stage with pooling, concatenation, and a prediction head. The unsplit variant retains consensus construction but replaces the two routes with a single residual correction. Removing support or conflict eliminates the corresponding prediction branch and its exclusive losses. The no-anchor variant replaces language-conditioned conflict retrieval with masked pooling over nonverbal conflict tokens. Learned-only and agreement-only variants isolate the two gate inputs. Each variant must be retrained with the same DeBERTa setup and data partition as the full model.
+
+\begin{table}[t]
+\centering
+\caption{Planned component ablations. Full-model rows show current results; pending denotes unmeasured results to be replaced before submission.}
+\label{tab:ablation}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Acc-7 ($\uparrow$) & Acc-5 ($\uparrow$) & Acc-2 ($\uparrow$) & F1 ($\uparrow$) & Corr ($\uparrow$) & MAE ($\downarrow$)\\
+\midrule
+\multicolumn{7}{l}{CMU-MOSI}\\
+CRED & 48.25 & 55.83 & 87.35 & 87.36 & 0.8390 & 0.6478\\
+Shared/private baseline & \multicolumn{6}{c}{pending}\\
+Unsplit residual & \multicolumn{6}{c}{pending}\\
+Without support correction & \multicolumn{6}{c}{pending}\\
+Without conflict correction & \multicolumn{6}{c}{pending}\\
+Without language anchor & \multicolumn{6}{c}{pending}\\
+Learned-only gate & \multicolumn{6}{c}{pending}\\
+Agreement-only gate & \multicolumn{6}{c}{pending}\\
+\midrule
+\multicolumn{7}{l}{CMU-MOSEI}\\
+CRED & 55.81 & 57.69 & 87.40 & 87.42 & 0.7995 & 0.5036\\
+Shared/private baseline & \multicolumn{6}{c}{pending}\\
+Unsplit residual & \multicolumn{6}{c}{pending}\\
+Without support correction & \multicolumn{6}{c}{pending}\\
+Without conflict correction & \multicolumn{6}{c}{pending}\\
+Without language anchor & \multicolumn{6}{c}{pending}\\
+Learned-only gate & \multicolumn{6}{c}{pending}\\
+Agreement-only gate & \multicolumn{6}{c}{pending}\\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\paragraph{Modality contributions and auxiliary objectives.}
+Table~\ref{tab:modal_loss} separates the effect of input modalities from training supervision. Language-only and bimodal variants require adapted donor and prediction paths and must be retrained. Loss ablations retain the architecture and remove one objective at a time. The directional-loss ablation tests whether encouraging support to reinforce the consensus is beneficial beyond task supervision.
+
+\begin{table}[t]
+\centering
+\caption{Planned modality and loss ablations on CMU-MOSI. Pending marks unmeasured entries.}
+\label{tab:modal_loss}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Acc-7 ($\uparrow$) & Acc-5 ($\uparrow$) & Acc-2 ($\uparrow$) & F1 ($\uparrow$) & Corr ($\uparrow$) & MAE ($\downarrow$)\\
+\midrule
+CRED & 48.25 & 55.83 & 87.35 & 87.36 & 0.8390 & 0.6478\\
+\multicolumn{7}{l}{Modality contributions}\\
+Language only & \multicolumn{6}{c}{pending}\\
+Language + audio & \multicolumn{6}{c}{pending}\\
+Language + vision & \multicolumn{6}{c}{pending}\\
+\multicolumn{7}{l}{Auxiliary objectives}\\
+Without routing loss & \multicolumn{6}{c}{pending}\\
+Without support-scale loss & \multicolumn{6}{c}{pending}\\
+Without directional loss & \multicolumn{6}{c}{pending}\\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Further analysis}
+\noindent\emph{[Draft status: figures below are layout placeholders, not experimental visualizations. Interpretive paragraphs will be completed after measurements are available.]}
+
+\paragraph{Sentiment granularity.}
+Following DLF's fine-grained analysis, Figure~\ref{fig:granularity} will report seven-class confusion matrices for MOSI and MOSEI. The matrices will use the same clipped and rounded labels and predictions as Acc-7, with each row normalized by its ground-truth class count. Class support will be shown to distinguish rare sentiment extremes from frequently occurring errors.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox[c][30mm][c]{0.9\linewidth}{\centering Pending measured plots:\\MOSI and MOSEI confusion matrices\\Row-normalized values and class counts}}
+\caption{Planned seven-class sentiment analysis. Placeholder; test predictions are required.}
+\label{fig:granularity}
+\end{figure}
+
+\paragraph{Effects of the two corrections.}
+Figure~\ref{fig:corrections} will compare errors for $b$, $b+\Delta_s$, $b+\Delta_c$, and $b+\Delta_s+\Delta_c$ on the same test samples. The signed error reductions in Equation~\eqref{eq:effects}, together with their order-averaged counterparts in the appendix, will show the distribution of helpful and harmful corrections. This diagnostic uses one trained model; the retrained variants in Table~\ref{tab:ablation} assess architectural contributions.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox[c][30mm][c]{0.9\linewidth}{\centering Pending measured plots:\\MAE of four prediction combinations\\Support/conflict error reductions\\Helpful, unchanged, and harmful fractions}}
+\caption{Planned correction-effect analysis on fixed test predictions. Placeholder; no outcomes are implied.}
+\label{fig:corrections}
+\end{figure}
+
+\paragraph{Sensitivity to routing temperature.}
+The temperature $\tau$ controls the concentration of donor weights. Figure~\ref{fig:sensitivity} will compare independently trained variants using $\tau\in\{0.5,1.0,1.5,2.0,3.0\}$. Other settings will remain fixed, and temperature selection will use validation MAE. The validation curves will describe sensitivity without selecting a configuration from test performance.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox[c][25mm][c]{0.9\linewidth}{\centering Pending measured plot:\\Routing temperature versus validation MAE\\One curve per dataset}}
+\caption{Planned sensitivity analysis of routing temperature. Placeholder; validation measurements are required.}
+\label{fig:sensitivity}
+\end{figure}
+
+\paragraph{Qualitative examples.}
+Table~\ref{tab:cases} will pair transcript excerpts and observable acoustic/visual cues with the reference prediction and both corrections. Cases will include helpful support, helpful conflict, and a failure. Sample identities and numerical outputs will be retained; semantic descriptions will be based on the original clips.
+
+\begin{table}[t]
+\centering
+\caption{Planned qualitative examples. Case contents and values are pending; row names describe selection categories, not observed findings.}
+\label{tab:cases}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+Case category & Clip/cues & $y$ & $b$ & $\Delta_s$ & $\Delta_c$ & $\hat y$\\
+\midrule
+Helpful support & \multicolumn{6}{c}{pending}\\
+Helpful conflict & \multicolumn{6}{c}{pending}\\
+Harmful correction & \multicolumn{6}{c}{pending}\\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\paragraph{Computational cost.}
+Table~\ref{tab:efficiency} will report parameter counts and inference latency for CRED and internal reference variants on the same device, batch size, precision, and sequence-length distribution. Both total and trainable parameters will be counted. Latency will include every operation executed in the measured prediction path, including auxiliary probes if they remain active.
+
+\begin{table}[t]
+\centering
+\caption{Planned efficiency comparison. Measurements are pending; all variants use the same timing protocol.}
+\label{tab:efficiency}
+\begin{tabular}{lccc}
+\toprule
+Variant & Total params & Trainable params & ms/utterance\\
+\midrule
+Shared/private baseline & pending & pending & pending\\
+Unsplit residual & pending & pending & pending\\
+CRED & pending & pending & pending\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+\subsection{What the model makes explicit}
+The framework links a representational decision to a prediction decision. A residual is formed relative to consensus, split into two candidate roles, and read by heads with different access patterns. Support uses a pooled summary, whereas conflict retrieval is conditioned on language and restricted to nonverbal conflict tokens. Both routes update the same reference prediction. This organization makes it possible to inspect whether retaining a routed feature leads to a useful correction, instead of interpreting a feature visualization in isolation.
+
+The split also preserves a distinction that shared/private encoding leaves open. Private information can be useful because it reinforces a consensus or because it challenges that consensus. Complementary routing allows both cases within one sample. However, preservation of the residual is a structural fact; useful allocation of its coordinates is a learning outcome. The available benchmark outputs do not verify the latter.
+
+\subsection{How to assess correction behavior}
+For predictions from a fixed trained model, let $e_0=|y-b|$, $e_s=|y-(b+\Delta_s)|$, and $e_f=|y-\hat y|$. Then
+\begin{equation}
+H_s=e_0-e_s,\qquad H_c=e_s-e_f,
+\label{eq:effects}
+\end{equation}
+give the signed error reductions of support and subsequent conflict correction under the declared order. Positive values indicate a helpful correction, and negative values indicate harm. Their sum equals $e_0-e_f$ for each sample. Means, distributions, and helpful/harmful fractions would reveal whether a lower final MAE conceals frequent adverse corrections.
+
+These quantities depend on the order of adding the terms because absolute error is nonlinear. An order-averaged allocation can also be computed by averaging each branch's improvement when added first and when added second. Neither analysis replaces retrained ablations. Setting a branch to zero in one trained model assesses its numerical role in that model; retraining without the branch assesses whether the architecture requires it.
+
+Conflict-stratified evaluation should additionally use evidence independent of the gate being assessed. Stratifying only by $1-G_m$ risks evaluating the method on its own definition of conflict. Manually annotated disagreement or separately trained, frozen unimodal predictors can provide complementary strata. Any proxy should be named as such, and bin thresholds should be fixed using validation data. These are proposed analyses; their outcomes are not available in the present result record.
+
+\subsection{Limitations}
+The published-baseline comparison reflects differences between complete systems, including their language encoders and feature pipelines. It therefore does not isolate the contribution of residual routing. The component ablations and correction analyses marked as pending in the experimental section are needed to establish that contribution.
+
+The modeling assumptions introduce further boundaries. A language anchor can propagate transcript errors. The route depends partly on cosine agreement in learned feature space, which can reflect calibration or feature geometry rather than affective contradiction. Detached probe targets avoid gradient flow through target construction but can still be inaccurate. Complementary allocation and covariance penalties do not guarantee independent or identifiable factors. Finally, the present setting does not establish robustness to missing modalities, unaligned input, cross-language transfer, or sarcasm. Those settings require separate evaluation.
+
+\section{Conclusion}
+We introduced CRED, a serial framework that connects shared/private representation learning to consensus-relative residual routing for multimodal sentiment analysis. Agreement-weighted donor attention establishes a reference representation, complementary gates retain candidate support and conflict, and language-anchored retrieval supplies a separately scaled conflict correction. The additive prediction exposes how both corrections modify a consensus estimate, while structural analysis clarifies what this decomposition does and does not guarantee.
+
+CRED achieves MAEs of 0.6478 on CMU-MOSI and 0.5036 on CMU-MOSEI, with correlations of 0.8390 and 0.7995, respectively. The comparison with published methods shows competitive regression performance, while the fine-grained classification results leave room for improvement. The framework offers a testable connection between the origin of multimodal features and their role in changing a sentiment prediction.
+
+\appendix
+\section{Auxiliary objectives and diagnostic definitions}
+\label{app:objectives}
+\subsection{Routing reductions}
+Let $a_{m,i,t}=d^{-1}\sum_j(1-G_{m,i,t,j})$ be the conflict allocation averaged over channels for sample $i$. Let $\bar a_{m,i}$ and $v_{m,i}$ denote its masked temporal mean and variance. The implementation combines mean-allocation fitting with a variance floor:
+\begin{equation}
+\mathcal L_{\rm route}=\sum_m\left[
+\operatorname{MSE}(\bar a_m,t_m)
++\E\,\operatorname{ReLU}(v_{\min}t_m-v_m)\right],
+\label{eq:route_appendix}
+\end{equation}
+with $v_{\min}=0.01$. The modality targets are constant across the valid tokens of an utterance. They supervise an aggregate allocation, not the semantic role of each token. Exact masking and eligibility details follow the supplied implementation.
+
+\subsection{Support task and gate supervision}
+For a sample-level low-conflict weight $w_i$ derived from detached probe disagreement, the support task loss has the normalized weighted form
+\begin{equation}
+\mathcal L_{\rm support}=\frac{\sum_i w_i|y_i-\sg(b_i)-\Delta_{s,i}|}{\max(\sum_i w_i,1)}.
+\end{equation}
+The continuous scale loss applies Smooth-L1 between $s_s$ and Equation~\eqref{eq:optimal_scale}, without the low-conflict weight $w_i$, and excludes samples when $|d_{s,i}|<10^{-4}$. Gradients do not pass through the constructed target or the task weight. They continue to train the scale predictor and the features on which it depends. The supplied code defines $w_i=1-\frac13\sum_m t_{m,i}$; this rule must be frozen with the final experiment configuration.
+
+\subsection{Order-averaged correction allocation}
+Let $E(S)$ be the absolute error when adding the correction subset $S\subseteq\{s,c\}$ to the same consensus prediction. An order-averaged reduction is
+\begin{align}
+\varphi_s&=\tfrac12\{E(\varnothing)-E(\{s\})+E(\{c\})-E(\{s,c\})\},\\
+\varphi_c&=\tfrac12\{E(\varnothing)-E(\{c\})+E(\{s\})-E(\{s,c\})\}.
+\end{align}
+Adding the equations gives $\varphi_s+\varphi_c=E(\varnothing)-E(\{s,c\})$. This algebraic allocation averages the two possible addition orders for fixed scalar corrections. It is not a causal intervention on the raw modalities, and no empirical values are claimed for it here.
+
+\section*{Data and code availability}
+CMU-MOSI and CMU-MOSEI are external research datasets cited in this article. Access should follow their original distribution conditions. The manuscript is based on a local code snapshot. A public release address, frozen run configurations, checkpoints, and per-sample predictions have not yet been supplied.
+
+\section*{Ethics statement}
+The authors must confirm the access conditions for the benchmark datasets and whether any additional human annotation or identifiable material was used. An ethics determination is not inferred from the supplied project files.
+
+\section*{CRediT authorship contribution statement}
+Author identities and individual CRediT roles require author confirmation before submission.
+
+\section*{Funding}
+Funding sources and grant numbers require author confirmation. The absence of funding is not inferred from the project files.
+
+\section*{Declaration of competing interest}
+The authors must provide and confirm their competing-interest statement before submission.
+
+\section*{Acknowledgments}
+Acknowledgments, if any, require author confirmation before submission.
+
+\section*{Declaration of generative AI use}
+Draft for author review: During preparation of this manuscript, the authors used OpenAI Codex to assist with drafting, checking consistency with supplied source code, and organizing references. The authors must review and take responsibility for the final text before submission. The supplied numerical results were not generated or replaced by the writing assistant.
+
+\bibliographystyle{elsarticle-num}
+\bibliography{references}
+\end{document}
